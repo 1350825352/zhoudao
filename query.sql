@@ -1,0 +1,1 @@
+SELECT id,sn,device_type,device_name FROM device WHERE deleted=0 AND (device_type IN (3,1) AND deleted = 0 AND org_uuid = '8566c7de-05ac-41ee-b260-1614848ed037' AND project_uuid = '826ccf49-8430-4037-a505-cd43b868d4d6');

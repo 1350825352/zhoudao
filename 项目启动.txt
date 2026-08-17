@@ -1,0 +1,78 @@
+
+执行：
+plaintext
+mvn clean package -DskipTests
+打包成功后，jar 文件在：
+plaintext
+_test_openapi_waylines.pyH:\traeproject\ceshisikongapiAI\target\
+进去看：
+plaintext
+H:\traeproject\ceshisikongapiAI\target\xxx.jar
+
+2. 快速在控制台直接打开目录
+java -jar target\你的文件名.jar
+
+
+
+## 核心规则
+**`npm run dev` 必须进入【包含 package.json】的目录执行**
+你这里是三个独立前端，互不干扰：
+```
+H:\traeproject\ceshisikongapiAI\qianduan\
+├─ admin-3   # 后台管理前端
+├─ h5-3      # 手机H5前端
+└─ screen-3  # 大屏展示前端
+```
+
+### 1. 启动【后台管理 admin-3】
+新开终端执行：
+```powershell
+cd H:\traeproject\ceshisikongapiAI\qianduan\admin-3
+# 首次运行先装依赖
+npm install
+# 启动
+npm run dev
+```
+
+### 2. 启动【H5移动端 h5-3】
+**另开一个全新终端窗口**
+```powershell
+cd H:\traeproject\ceshisikongapiAI\qianduan\h5-3
+npm install
+npm run dev
+```
+
+### 3. 启动【大屏 screen-3】
+**再新开一个终端窗口**
+```powershell
+cd H:\traeproject\ceshisikongapiAI\qianduan\screen-3
+npm install
+npm run dev
+```
+
+> ⚠️ 重要提醒：
+> 三个前端**必须分开三个终端同时运行**，不能在同一个窗口来回切换；
+> 各自端口默认不一样（一般 admin 5173、h5 5174、screen 5175，自动错开）
+
+## 怎么验证目录是否进对了？
+进入目录后输入：
+```powershell
+ls package.json
+```
+能看到文件，代表目录正确；提示找不到文件，就是路径错了。
+
+## 常见踩坑
+1. ❌ 不要在 `qianduan` 文件夹直接执行 `npm run dev`，外面没有 package.json，会报错
+2. ❌ 不要混用同一个终端先后启动，要多开窗口
+3. 启动后打不开接口：检查每个项目里 `vite.config.js` 的代理地址，确认指向你的 SpringBoot 后端地址
+
+## 启动完整流程汇总
+1. 终端A：启动 SpringBoot 后端（保持常开）
+2. 终端B：`cd admin-3` → `npm run dev`
+3. 终端C：`cd h5-3` → `npm run dev`
+4. 终端D：`cd screen-3` → `npm run dev`
+
+如果你想，我可以给你写 **3条一键切换目录并启动的PowerShell快捷命令**，以后直接复制运行。
+
+
+

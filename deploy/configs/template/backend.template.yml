@@ -1,0 +1,59 @@
+company:
+  name: "请填写公司名称"
+
+server:
+  port: 8080
+
+spring:
+  datasource:
+    url: jdbc:mysql://localhost:3306/your_database?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
+    username: your_username
+    password: your_password
+
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      password: ""
+      database: 0
+
+  mail:
+    host: smtp.qq.com
+    port: 587
+    username: your_email@qq.com
+    password: your_email_password
+
+h5:
+  host: 192.168.2.130
+  port: 3203
+
+dji:
+  mqtt:
+    host: tcp://your_dji_mqtt_host:11883
+    username: your_dji_mqtt_username
+    password: your_dji_mqtt_password
+
+  openapi:
+    user-token: your_dji_user_token
+    default-organization-uuid: your_organization_uuid
+    default-project-uuid: your_project_uuid
+
+  media:
+    stream-server:
+      rtmp-url: rtmp://your_stream_server/live?secret=your_secret
+      pull-url-template: http://your_stream_server:2022/live/{streamKey}.flv?secret={secret}
+      rtmp-url-internal: rtmp://your_internal_stream_server:1935/live?secret=your_secret
+      pull-url-template-internal: http://your_internal_stream_server:2022/live/{streamKey}.flv?secret={secret}
+      rtmp-url-ai: rtmp://your_internal_stream_server/live/ai/{streamKey}?secret={secret}
+
+zhimou:
+  openapi:
+    base-url: http://your_zhimou_server:10042
+    appkey: your_zhimou_appkey
+    appsecret: your_zhimou_appsecret
+    callback-url: http://your_backend_host:8080/api/zhimou/callback
+    default-app-id: "your_app_id"
+    default-pkg-id: "your_pkg_id"
+
+  image:
+    save-root-dir: /path/to/zhimou-images

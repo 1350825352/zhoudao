@@ -1,0 +1,55 @@
+@primary-color: #0552bc;
+@login-bg: #eff3fc;
+@header-bg: #0a2342;
+@sidebar-width: 210px;
+@card-radius: 4px;
+@login-radius: 12px;
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #app {
+  width: 100%;
+  height: 100%;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  color: #333;
+}
+
+a {
+  text-decoration: none;
+  color: inherit;
+}
+
+.el-button--primary {
+  background-color: @primary-color !important;
+  border-color: @primary-color !important;
+}
+
+.el-button--primary:hover {
+  background-color: #0a65d9 !important;
+  border-color: #0a65d9 !important;
+}
+
+.el-menu {
+  border-right: none !important;
+}
+
+.el-menu-item.is-active {
+  background-color: #e6f0ff !important;
+  color: @primary-color !important;
+}
+
+.el-menu-item:hover {
+  background-color: #f0f5ff !important;
+}
+
+.el-input__wrapper.is-focus {
+  box-shadow: 0 0 0 1px @primary-color inset !important;
+}
+
+.el-card {
+  border-radius: @card-radius !important;
+}

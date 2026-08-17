@@ -1,0 +1,120 @@
+好的，我先备份代码，然后告诉你备份位置和恢复方法。
+
+
+
+
+
+
+
+        
+            
+toolName: Shell
+            
+status: success
+          
+          
+工作区干净，没有未提交的修改。让我查看备份记录并打一个标签方便你恢复。
+
+
+
+
+
+
+
+
+
+
+        
+            
+toolName: Shell
+            
+status: success
+          
+          
+
+        
+            
+toolName: Shell
+            
+status: success
+          
+          
+
+        
+            
+toolName: Shell
+            
+status: success
+          
+          
+代码备份完成！以下是备份说明和恢复方法：
+
+---
+
+## 📦 代码备份位置
+
+备份存储在项目根目录下的 **Git 版本库**中：
+```
+h:\traeproject\ceshisikongapiAI\.git\
+```
+
+所有历史版本都在这里，不会丢失。
+
+---
+
+## 🏷️ 当前备份标签
+
+| 标签名 | 时间 | 说明 | 对应commit |
+|--------|------|------|-----------|
+| `v20260803` | 2026-08-03 | 服务启动完成，代码稳定 | `3bf44d8` |
+
+---
+
+## 🔄 恢复方法
+
+### 方法一：恢复到最新备份（推荐）
+在项目目录执行：
+```bash
+cd h:\traeproject\ceshisikongapiAI
+git reset --hard v20260803
+```
+
+### 方法二：恢复到指定历史版本
+先查看所有历史版本：
+```bash
+cd h:\traeproject\ceshisikongapiAI
+git log --oneline
+```
+
+然后选择要恢复的commit（例如恢复到WebRTC修复前）：
+```bash
+git reset --hard 16b2496
+```
+
+### 方法三：查看某个文件的历史版本
+如果只想恢复单个文件：
+```bash
+# 查看文件的修改历史
+git log --oneline src/main/java/com/dji/sikong/controller/ApiController.java
+
+# 恢复某个版本的单个文件
+git checkout 16b2496 -- src/main/java/com/dji/sikong/controller/ApiController.java
+```
+
+---
+
+## ⚠️ 注意事项
+
+1. **恢复前建议先备份当前修改**（如果有未提交的改动）：
+   ```bash
+   git stash      # 暂存当前修改
+   # 或
+   git add . && git commit -m "临时备份"
+   ```
+
+2. **`git reset --hard` 会彻底丢弃当前所有未提交的修改**，请确认后再执行。
+
+3. 如果想对比两个版本的差异：
+   ```bash
+   git diff v20260803 16b2496
+   ```

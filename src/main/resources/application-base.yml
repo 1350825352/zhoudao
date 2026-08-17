@@ -1,0 +1,96 @@
+server:
+  servlet:
+    context-path: /api
+
+spring:
+  application:
+    name: sikong-cloud-api
+
+  servlet:
+    multipart:
+      enabled: true
+      max-file-size: 10MB
+      max-request-size: 10MB
+
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
+  data:
+    redis:
+      timeout: 3000
+      lettuce:
+        pool:
+          max-active: 16
+          max-idle: 8
+          min-idle: 4
+
+  mail:
+    protocol: smtp
+    properties:
+      mail:
+        smtp:
+          auth: true
+          starttls:
+            enable: true
+            required: true
+        debug: false
+
+mybatis-plus:
+  mapper-locations: classpath*:mapper/**/*.xml
+  type-aliases-package: com.dji.sikong.entity
+  configuration:
+    map-underscore-to-camel-case: true
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+  global-config:
+    db-config:
+      id-type: auto
+      logic-delete-field: deleted
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+
+logging:
+  file:
+    name: target/springboot_start.log
+  charset:
+    console: UTF-8
+    file: UTF-8
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level --- [%15.15t] %-40.40logger{39} : %msg%n"
+    file: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level --- [%15.15t] %-40.40logger{39} : %msg%n"
+  level:
+    com.dji.sikong: debug
+    org.eclipse.paho: info
+
+dji:
+  mqtt:
+    client-id: sikong-cloud-api-${random.uuid}
+    connection-timeout: 30
+    keep-alive: 60
+    clean-session: true
+    automatic-reconnect: true
+    subscribe-topics:
+      - sys/product/+/status
+      - thing/product/+/osd
+      - thing/product/+/state
+      - thing/product/+/events
+      - thing/product/+/requests
+      - thing/product/+/services_reply
+      - thing/product/+/property/set_reply
+      - thing/product/+/property/post
+      - thing/product/+/drc/up
+      - thing/product/+/drc/down_reply
+
+  openapi:
+    base-url: https://es-flight-api-cn.djigate.com
+    language: zh
+    default-page-size: 50
+
+  media:
+    stream-server:
+      type: srs
+
+zhimou:
+  image:
+    url-prefix: /zhimou-img/
+
+  flight-report-interval-ms: 1000

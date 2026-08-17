@@ -1,0 +1,156 @@
+---
+
+## 📋 无人机监控平台 - Ubuntu 22.04 部署检查清单
+
+---
+
+### 🔴 第一部分：环境准备（部署前确认）
+
+- [ ] **操作系统**：Ubuntu 22.04 LTS (x86_64 架构)
+- [ ] **网络连通**：服务器能访问外网（安装依赖用）
+- [ ] **端口放行**：防火墙/安全组放行 80 端口（Nginx）
+- [ ] **SSH 权限**：有 root 或 sudo 权限
+- [ ] **MySQL 就绪**：
+  - [ ] 数据库已创建（如 `sikong_cloud_api`）
+  - [ ] 表结构和初始数据已导入
+  - [ ] 账号密码可用，且允许从部署机访问
+- [ ] **Redis 就绪**：
+  - [ ] Redis 服务已启动
+  - [ ] 密码（如有）正确
+  - [ ] 允许从部署机访问
+
+---
+
+### 🟡 第二部分：配置文件修改
+
+#### 📄 文件 1：`deploy/config.sh`
+（从 `config.example.sh` 复制）
+
+| 参数 | 说明 | 当前值 | 修改后 |
+|------|------|--------|--------|
+| `COMPANY_PROFILE` | 公司配置目录名 | `company-a` | |
+| `BACKEND_PORT` | 后端端口 | `8080` | |
+| `APP_ROOT` | 部署根目录 | `/opt/wurenji` | |
+| `INSTALL_MYSQL` | 是否本机安装 MySQL | `true` / `false` | |
+| `INSTALL_REDIS` | 是否本机安装 Redis | `true` / `false` | |
+| `SKIP_BUILD` | 是否跳过构建（有预编译包就 `true`） | `true` | |
+
+---
+
+#### 📄 文件 2：`deploy/configs/company-a/backend.yml`
+
+##### ① 基础信息
+| 参数 | 说明 | 当前值 | 修改后 |
+|------|------|--------|--------|
+| `company.name` | 公司名称 | 石知韵智能科技 | |
+
+##### ② 数据库（必须改）
+| 参数 | 说明 | 当前值 | 修改后 |
+|------|------|--------|--------|
+| `spring.datasource.url` | JDBC 连接地址 | `jdbc:mysql://192.168.2.200:3306/sikong_cloud_api?...` | |
+| `spring.datasource.username` | 数据库用户名 | `szy02` | |
+| `spring.datasource.password` | 数据库密码 | `123456` | |
+
+##### ③ Redis（必须改）
+| 参数 | 说明 | 当前值 | 修改后 |
+|------|------|--------|--------|
+| `spring.data.redis.host` | Redis 地址 | `192.168.2.200` | |
+| `spring.data.redis.port` | Redis 端口 | `6379` | |
+| `spring.data.redis.password` | Redis 密码（无则留空） | `""` | |
+
+##### ④ 邮件（发工单邮件用）
+| 参数 | 说明 | 当前值 | 修改后 |
+|------|------|--------|--------|
+| `spring.mail.host` | SMTP 服务器 | `smtp.qq.com` | |
+| `spring.mail.port` | SMTP 端口 | `587` | |
+| `spring.mail.username` | 发件邮箱 | `1350825352@qq.com` | |
+| `spring.mail.password` | 邮箱授权码（不是登录密码） | `yxrogsudehnvhhad` | |
+
+##### ⑤ H5 工单链接（必须改！影响邮件里的地址）
+| 参数 | 说明 | 当前值 | 修改后 |
+|------|------|--------|--------|
+| `h5.host` | 服务器 IP 或域名 | `192.168.2.200` | |
+| `h5.port` | 访问端口（一般 80） | `80` | |
+| `h5.context-path` | H5 路径前缀 | `h5` |
+
+##### ⑥ 大疆司空2 MQTT
+| 参数 | 说明 | 当前值 | 修改后 |
+|------|------|--------|--------|
+| `dji.mqtt.host` | MQTT 服务器地址 | `tcp://58.213.86.2:11883` | |
+| `dji.mqtt.username` | MQTT 用户名 | `zhimou_aivis` | |
+| `dji.mqtt.password` | MQTT 密码 | `aivis@zhimou` | |
+
+##### ⑦ 大疆司空2 OpenAPI
+| 参数 | 说明 | 当前值 | 修改后 |
+|------|------|--------|--------|
+| `dji.openapi.user-token` | 用户 Token | (长字符串) | |
+| `dji.openapi.default-organization-uuid` | 组织 UUID | `83f6ba9b-...` | |
+| `dji.openapi.default-project-uuid` | 项目 UUID | `5ac8e7fe-...` | |
+
+##### ⑧ 视频流服务器（SRS/Oryx）
+| 参数 | 说明 | 当前值 | 修改后 |
+|------|------|--------|--------|
+| `dji.media.stream-server.rtmp-url` | 公网 RTMP 推流地址 | `rtmp://58.213.86.2/live?...` | |
+| `dji.media.stream-server.pull-url-template` | 公网拉流地址模板 | `http://58.213.86.2:2022/...` | |
+| `dji.media.stream-server.rtmp-url-internal` | 内网 RTMP | `rtmp://192.168.2.201:1935/...` | |
+| `dji.media.stream-server.pull-url-template-internal` | 内网拉流 | `http://192.168.2.201:2022/...` | |
+| `dji.media.stream-server.rtmp-url-ai` | AI 识别推流 | `rtmp://192.168.2.201/live/ai/...` | |
+
+##### ⑨ 知眸AI识别
+| 参数 | 说明 | 当前值 | 修改后 |
+|------|------|--------|--------|
+| `zhimou.openapi.base-url` | 知眸服务地址 | `http://192.168.2.202:10042` | |
+| `zhimou.openapi.appkey` | AppKey | `75eda2b9...` | |
+| `zhimou.openapi.appsecret` | AppSecret | `IimhnRbe...` | |
+| `zhimou.openapi.callback-url` | 回调地址（知眸能访问到的地址） | `http://192.168.2.200:8080/api/zhimou/callback` | |
+| `zhimou.openapi.default-app-id` | 默认 AppID | `3y14nhqxbd,napvhsbecn` | |
+| `zhimou.openapi.default-pkg-id` | 默认 PkgID | `par579tq` | |
+
+##### ⑩ 图片保存目录（一般不用改）
+| 参数 | 说明 | 当前值 | 修改后 |
+|------|------|--------|--------|
+| `zhimou.image.save-root-dir` | 图片保存路径 | `/opt/wurenji/data/zhimou-images` | |
+
+---
+
+### 🟢 第三部分：执行部署
+
+- [ ] **上传项目**到服务器 `/opt/ceshisikongapiAI/`
+- [ ] **复制配置**：`cp deploy/config.example.sh deploy/config.sh`
+- [ ] **修改配置**：按上面清单改好 `config.sh` 和 `backend.yml`
+- [ ] **执行脚本**：`bash deploy/deploy.sh`
+- [ ] **观察输出**：没有报错，最后显示"部署完成"
+
+---
+
+### 🔵 第四部分：部署后验证
+
+#### 服务状态检查
+- [ ] 后端服务：`systemctl status sikong-backend` 显示 `active (running)`
+- [ ] Nginx：`systemctl status nginx` 显示 `active (running)`
+- [ ] 端口监听：`netstat -tlnp | grep -E "80|8080"` 都在监听
+
+#### 页面访问检查
+- [ ] 监控大屏：浏览器访问 `http://服务器IP/screen/` 页面正常显示
+- [ ] 后台管理：访问 `http://服务器IP/admin/` 能打开登录页
+- [ ] 工单H5：访问 `http://服务器IP/h5/` 能打开（或通过邮件链接）
+
+#### 功能检查
+- [ ] 登录：后台管理能正常登录
+- [ ] 图片：告警列表/工单详情的图片能正常显示
+- [ ] 上传：工单页面能上传照片（不报 413 错误）
+- [ ] 邮件：转工单后能收到邮件，且链接地址正确
+
+---
+
+### ⚠️ 常见问题快速修复
+
+| 问题 | 修复命令 |
+|------|----------|
+| 图片不显示（404） | `sed -i 's|原路径|/opt/wurenji/data/zhimou-images|' /opt/wurenji/backend/application-company-a.yml && systemctl restart sikong-backend` |
+| 上传照片报 413 | `sed -i '/server_name _;/a\    client_max_body_size 50M;' /etc/nginx/sites-available/sikong && nginx -t && systemctl reload nginx` |
+| 邮件链接 IP 不对 | 修改 `/opt/wurenji/backend/application-company-a.yml` 中 `h5.host`，然后 `systemctl restart sikong-backend` |
+
+---
+
+**核对完以上所有项目，部署就没问题了！** ✅

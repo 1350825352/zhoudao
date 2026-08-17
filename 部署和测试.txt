@@ -1,0 +1,403 @@
+---
+
+## 无人机监控平台 - Ubuntu 22.04 部署指南
+
+### 一、准备工作（在 Windows 开发机上执行）
+
+#### 方案 A：从源码构建（推荐首次部署）
+
+```powershell
+# 1. 进入项目目录
+cd h:\traeproject\ceshisikongapiAI
+
+# 2. 修改 Linux 配置文件（重要！）
+# 编辑 deploy\configs\company-a\backend.yml，确认以下配置：
+#   zhimou.image.save-root-dir: /opt/wurenji/data/zhimou-images
+#   h5.host: 服务器实际IP（如192.168.2.200）
+#   h5.port: 80
+#   h5.context-path: h5
+
+# 3. 打包（会自动构建前端和后端）
+# 后续会提供打包脚本，目前手动：
+#   - 后端：mvn clean package -DskipTests
+#   - 前端三个：npm run build
+```
+
+#### 方案 B：跳过构建（已有预编译包）
+
+直接使用已有的 `deploy-package.zip`，跳到第二步。
+
+---
+
+### 二、上传到 Ubuntu 服务器
+
+```powershell
+# 使用 WinSCP 或 scp 上传整个项目目录
+scp -r ./ceshisikongapiAI user@192.168.2.200:/opt/
+
+# 或者只上传预编译包（如果是方案B）
+scp deploy-package.zip user@192.168.2.200:/opt/
+```
+
+---
+
+### 三、在 Ubuntu 上执行部署
+
+```bash
+# 1. 进入项目目录
+cd /opt/ceshisikongapiAI
+
+# 2. 复制配置模板
+cp deploy/config.example.sh deploy/config.sh
+
+# 3. 编辑配置（根据实际情况修改）
+vim deploy/config.sh
+# 主要配置项：
+#   SKIP_BUILD="true"     # 有预编译包就设为true
+#   BACKEND_PORT="8080"
+#   SERVER_IP="192.168.2.200"
+
+# 4. 执行部署脚本
+bash deploy/deploy.sh
+```
+
+脚本会自动完成：
+- ✅ 检测/安装 Java 8（不会重复安装）
+- ✅ 检测 MySQL（已存在则跳过）
+- ✅ 检测 Redis（已存在则跳过）
+- ✅ 检测/安装 Nginx
+- ✅ 部署后端 jar 包并配置 systemd 服务
+- ✅ 部署三个前端（admin/screen/h5）
+- ✅ 配置 Nginx 反向代理
+
+---
+
+### 四、部署后检查 & 常见问题
+
+```bash
+# 查看后端状态
+systemctl status sikong-backend
+# 查看后端日志
+journalctl -u sikong-backend -f
+
+# 查看 Nginx 状态
+systemctl status nginx
+# 重启 Nginx
+systemctl reload nginx
+
+# 检查端口
+netstat -tlnp | grep -E "80|8080"
+```
+
+#### 常见问题修复
+
+| 问题 | 解决命令 |
+|------|----------|
+| 图片不显示 | `sed -i 's|H:/traeproject...|/opt/wurenji/data/zhimou-images|' /opt/wurenji/backend/application-company-a.yml && systemctl restart sikong-backend` |
+| 上传照片报 413 | `sed -i '/server_name _;/a\    client_max_body_size 50M;' /etc/nginx/sites-available/sikong && nginx -t && systemctl reload nginx` |
+| 邮件工单链接 IP 错误 | 修改 `/opt/wurenji/backend/application-company-a.yml` 中的 `h5.host` |
+| 前端页面空白 | 检查 Nginx 配置中 `try_files` 是否正确，前端构建 base 路径是否为子路径 |
+
+---
+
+### 五、访问地址
+
+部署成功后，通过以下地址访问：
+
+| 系统 | 地址 |
+|------|------|
+| 监控大屏 | http://服务器IP/screen/ |
+| 后台管理 | http://服务器IP/admin/ |
+| 工单H5 | http://服务器IP/h5/ |
+| 后端API | http://服务器IP/api/ |
+
+---
+
+### 六、数据目录说明
+
+部署完成后，所有数据都在 `/opt/wurenji/` 下：
+
+```
+/opt/wurenji/
+├── backend/              # 后端 jar 和配置
+│   ├── sikong-cloud-api-1.0.0.jar
+│   └── application-*.yml
+├── frontends/            # 三个前端静态文件
+│   ├── admin/
+│   ├── screen/
+│   └── h5/
+└── data/
+    ├── zhimou-images/    # 知眸识别图片（按月分子目录）
+    └── logs/             # 后端日志（如有）
+```
+
+---
+
+部署脚本在 [deploy.sh](file:///h:/traeproject/ceshisikongapiAI/deploy/deploy.sh)，配置模板在 [config.example.sh](file:///h:/traeproject/ceshisikongapiAI/deploy/config.example.sh)。
+
+
+
+
+
+
+
+
+
+
+
+让我先看看 deploy.sh 对 MySQL、Redis 的处理逻辑，再回答你：
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        
+            
+toolName: search_by_regex
+            
+status: success
+          
+query: mysql|redis
+          
+部署到其他 Ubuntu 22.04 机器**大部分情况没问题**，但有几个需要注意的地方：
+
+---
+
+### ✅ 没问题的部分
+
+- **Java 8、Nginx**：脚本会自动检测安装，x86_64 架构的 Ubuntu 22.04 通用
+- **前端静态文件**：纯 HTML/JS/CSS，任何机器都能跑
+- **后端 jar 包**：跨平台，只要有 Java 8 就能运行
+
+---
+
+### ⚠️ 需要注意/可能出问题的部分
+
+| 问题 | 说明 | 解决办法 |
+|------|------|----------|
+| **MySQL/Redis 不在本机** | 脚本默认只检测不安装（`INSTALL_MYSQL="false"`），如果新机器没有 MySQL，会连不上数据库 | 如果数据库在另一台机器，修改 `application-company-a.yml` 里的数据库地址；如果要在本机装，设 `INSTALL_MYSQL="true"` |
+| **数据库是空的** | 新机器即使装了 MySQL，也没有数据库和表 | 需要手动导入数据库（`CREATE DATABASE` + 执行建表 SQL），或者从原机器 `mysqldump` 导出再导入 |
+| **配置里的 IP 不对** | `application-company-a.yml` 里 `h5.host` 写死了 IP（192.168.2.200），部署到新机器会导致邮件里的工单链接还是旧 IP | 部署前修改 `deploy/configs/company-a/backend.yml` 里的 `h5.host` 为新机器 IP |
+| **Redis 不在本机** | 同理，如果 Redis 在另一台机器，需要改配置 | 修改 `application-company-a.yml` 里的 Redis 地址 |
+| **图片目录是空的** | 新机器 `/opt/wurenji/data/zhimou-images/` 没有历史图片 | 从原机器 `scp -r` 复制过去 |
+| **Ubuntu 不是 22.04** | 脚本是针对 22.04 写的，20.04 或 24.04 可能有些包名或 Java 路径不同 | 建议还是用 22.04 |
+| **ARM 架构机器** | 比如树莓派、飞腾服务器，Java 8 的包路径可能不同 | 需要手动改脚本里的 Java 路径检测逻辑 |
+
+---
+
+### 📋 部署到新机器的检查清单
+
+部署前确认：
+
+```
+□ 1. 新机器是 Ubuntu 22.04 (x86_64)
+□ 2. MySQL 已就绪（本机或远程），且数据库和表已创建
+□ 3. Redis 已就绪（本机或远程）
+□ 4. 修改了配置里的 IP：
+     - deploy/configs/company-a/backend.yml 中的 h5.host
+     - deploy/config.sh 中的 SERVER_IP
+□ 5. 如果用远程 MySQL/Redis，改好了 application-company-a.yml 里的连接地址
+□ 6. 如果有历史图片，复制到新机器 /opt/wurenji/data/zhimou-images/
+```
+
+---
+
+**总结**：只要是 Ubuntu 22.04 x86_64，并且 MySQL/Redis 准备好了，改一下配置里的 IP，部署脚本就能直接用。最容易忘的就是**数据库迁移**和**IP 配置**。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+配置文件和参数：
+让我看看所有需要配置的文件内容，整理成清单：
+
+
+
+        
+            
+toolName: view_files
+            
+status: success
+          
+            
+filePath: h:\traeproject\ceshisikongapiAI\deploy\config.example.sh
+          
+
+        
+            
+toolName: file_search
+            
+status: success
+          
+file_pattern: deploy/configs/**/*.yml
+          
+
+        
+            
+toolName: view_files
+            
+status: success
+          
+            
+filePath: h:\traeproject\ceshisikongapiAI\deploy\configs\company-a\backend.yml
+          
+
+        
+            
+toolName: view_files
+            
+status: success
+          
+            
+filePath: h:\traeproject\ceshisikongapiAI\deploy\configs\template\backend.template.yml
+          
+---
+
+## 部署到全新 Ubuntu 22.04 - 配置文件和参数清单
+
+需要配置 **2 个文件**，以下是所有需要修改的参数：
+
+---
+
+### 📄 文件 1：`deploy/config.sh`
+
+路径：[config.example.sh](file:///h:/traeproject/ceshisikongapiAI/deploy/config.example.sh)
+
+复制为 `deploy/config.sh` 后修改：
+
+| 参数 | 说明 | 示例 |
+|------|------|------|
+| `COMPANY_PROFILE` | 公司配置目录名 | `company-a` |
+| `BACKEND_PORT` | 后端端口 | `8080` |
+| `APP_ROOT` | 部署根目录 | `/opt/wurenji` |
+| `INSTALL_MYSQL` | 是否安装 MySQL（本机装就 `true`，远程数据库就 `false`） | `true` |
+| `INSTALL_REDIS` | 是否安装 Redis（本机装就 `true`，远程就 `false`） | `true` |
+| `SKIP_BUILD` | 是否跳过构建（有预编译包就 `true`） | `true` |
+
+---
+
+### 📄 文件 2：`deploy/configs/company-a/backend.yml`
+
+路径：[backend.yml](file:///h:/traeproject/ceshisikongapiAI/deploy/configs/company-a/backend.yml)
+
+**按顺序修改以下参数**：
+
+#### ① 数据库连接
+```yaml
+spring:
+  datasource:
+    url: jdbc:mysql://数据库IP:3306/数据库名?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
+    username: 数据库用户名
+    password: 数据库密码
+```
+
+#### ② Redis 连接
+```yaml
+  data:
+    redis:
+      host: Redis服务器IP
+      port: 6379
+      password: ""      # 没有密码就留空
+      database: 0
+```
+
+#### ③ 邮件配置（发工单邮件用）
+```yaml
+  mail:
+    host: smtp.qq.com        # QQ邮箱就这个，其他邮箱改对应SMTP服务器
+    port: 587
+    username: 发件邮箱@qq.com
+    password: 邮箱授权码        # 注意是授权码，不是登录密码
+```
+
+#### ④ H5 工单链接（邮件里的地址）
+```yaml
+h5:
+  host: 服务器公网IP或域名      # ⚠️ 改这个！比如 192.168.2.200
+  port: 80                       # Nginx 端口，一般是 80
+  context-path: h5               # 不用改
+```
+
+#### ⑤ 大疆司空2 MQTT
+```yaml
+dji:
+  mqtt:
+    host: tcp://MQTT服务器IP:11883
+    username: MQTT用户名
+    password: MQTT密码
+```
+
+#### ⑥ 大疆司空2 OpenAPI
+```yaml
+  openapi:
+    user-token: 你的user-token
+    default-organization-uuid: 组织UUID
+    default-project-uuid: 项目UUID
+```
+
+#### ⑦ 视频流服务器（SRS/Oryx）
+```yaml
+  media:
+    stream-server:
+      rtmp-url: rtmp://公网IP/live?secret=xxx
+      pull-url-template: http://公网IP:2022/live/{streamKey}.flv?secret={secret}
+      rtmp-url-internal: rtmp://内网IP:1935/live?secret=xxx    # 内网访问的地址
+      pull-url-template-internal: http://内网IP:2022/live/{streamKey}.flv?secret={secret}
+      rtmp-url-ai: rtmp://内网IP/live/ai/{streamKey}?secret={secret}
+```
+
+#### ⑧ 知眸AI识别
+```yaml
+zhimou:
+  openapi:
+    base-url: http://知眸服务器IP:10042
+    appkey: 知眸appkey
+    appsecret: 知眸appsecret
+    callback-url: http://后端服务器IP:8080/api/zhimou/callback   # ⚠️ 这个IP必须是知眸能访问到的
+    default-app-id: "app_id1,app_id2"
+    default-pkg-id: "pkg_id"
+```
+
+#### ⑨ 图片保存目录（Linux 一般不用改）
+```yaml
+  image:
+    save-root-dir: /opt/wurenji/data/zhimou-images
+```
+
+---
+
+### 📋 额外准备工作（不在配置文件里）
+
+部署前还需要做：
+
+| 项目 | 说明 |
+|------|------|
+| **数据库导入** | 确保 MySQL 中已创建数据库并导入表结构和初始数据 |
+| **端口放行** | 确保防火墙/安全组放行 80（Nginx）、8080（后端，如直接访问） |
+| **图片复制** | 如有历史图片，复制到 `/opt/wurenji/data/zhimou-images/` |
+| **知眸回调地址** | 确保知眸服务器能访问到 `callback-url`（内网穿透或同网段） |
+
+---
+
+**一句话总结**：主要改 `backend.yml` 里的 **IP 地址、账号密码**，`config.sh` 里决定装不装 MySQL/Redis。其他参数一般沿用现有配置即可。
