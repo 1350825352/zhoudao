@@ -72,5 +72,5 @@ zhimou:
     default-pkg-id: "par579tq"
 
   image:
-    save-root-dir: H:/traeproject/ceshisikongapiAI/zhimou-images
+    save-root-dir: H:/traeproject/zhoudao/zhimou-images
     url-prefix: /zhimou-img/

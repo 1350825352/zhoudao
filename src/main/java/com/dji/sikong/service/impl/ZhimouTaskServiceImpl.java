@@ -116,6 +116,10 @@ public class ZhimouTaskServiceImpl extends ServiceImpl<ZhimouTaskMapper, ZhimouT
     @Resource
     private com.dji.sikong.service.LiveStreamService liveStreamService;
 
+    /** 二期新增: 数据源开关服务 */
+    @Resource
+    private com.dji.sikong.service.TaskSwitchService taskSwitchService;
+
     private static final String LAST_FLIGHT_REPORT_TS_KEY = "zhimou:last_flight_report_ts:";
     private static final String ZHIMOU_ALERT_TOPIC_PREFIX = "zhimou/alert/";
 
@@ -145,6 +149,35 @@ public class ZhimouTaskServiceImpl extends ServiceImpl<ZhimouTaskMapper, ZhimouT
     /** 1秒调度器: 检测所有运行中直播的HTTP-FLV流状态, 自动创建/关闭知眸任务 */
     @org.springframework.scheduling.annotation.Scheduled(fixedDelay = 1000L)
     public void unifiedScheduler2Seconds() {
+        // ⭐ 二期新增: 检查视频任务开关, 关闭时立即关闭所有运行中的知眸视频任务, 并停止创建新任务
+        boolean videoTaskEnabled = false;
+        try {
+            videoTaskEnabled = taskSwitchService.isVideoTaskEnabled();
+        } catch (Exception e) {
+            // Redis/DB 不可用时, 默认开启(不影响一期逻辑)
+        }
+        if (!videoTaskEnabled) {
+            // 开关关闭: 立即关闭所有运行中的知眸视频任务(方案B)
+            try {
+                LambdaQueryWrapper<LiveStream> closeQw = new LambdaQueryWrapper<>();
+                closeQw.eq(LiveStream::getDeleted, 0).eq(LiveStream::getZhimouStatus, 1);
+                List<LiveStream> runningStreams = liveStreamMapper.selectList(closeQw);
+                for (LiveStream live : runningStreams) {
+                    try {
+                        closeZhimouTaskByLiveStreamId(live.getId());
+                        System.out.println("[知眸-开关] 视频任务关闭, 关闭运行中任务 liveId=" + live.getId());
+                    } catch (Exception ex) {
+                        System.out.println("[知眸-开关] 关闭任务异常 liveId=" + live.getId() + " err=" + ex.getMessage());
+                    }
+                }
+                // 清空防抖状态
+                STREAM_DEBOUNCE_MAP.clear();
+                ZHIMOU_TASK_CHECK_MAP.clear();
+            } catch (Exception ex) {
+                System.out.println("[知眸-开关] 关闭运行中视频任务异常: " + ex.getMessage());
+            }
+            return; // 不再创建新任务
+        }
         System.out.println("[知眸-DEBUG] unifiedScheduler2Seconds 被调用了! ts=" + System.currentTimeMillis());
         final long now = System.currentTimeMillis();
         int detectCnt = 0, createCnt = 0, closeCnt = 0, skipCnt = 0;

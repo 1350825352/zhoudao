@@ -122,6 +122,17 @@ public class WaylineServiceImpl extends ServiceImpl<WaylineMapper, Wayline> impl
 
                 w.setSyncSource(1);
                 w.setLastSyncTime(LocalDateTime.now());
+                // ⭐ 修复: 提取司空2返回的航线实际修改时间(毫秒时间戳), 覆盖同步时间
+                if (node.has("update_time")) {
+                    try {
+                        long ts = node.get("update_time").asLong();
+                        if (ts > 0) {
+                            w.setUpdateTime(java.time.LocalDateTime.ofInstant(
+                                    java.time.Instant.ofEpochMilli(ts),
+                                    java.time.ZoneId.systemDefault()));
+                        }
+                    } catch (Exception ignore) {}
+                }
                 try { w.setRawJson(node.toString()); } catch (Exception ignore) {}
 
                 if (StrUtil.isBlank(w.getWpmlDownloadUrl()) && StrUtil.isNotBlank(wuuid)) {

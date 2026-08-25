@@ -73,6 +73,12 @@ public class ApiController {
     private ZhimouDetectionResultMapper detectionResultMapper;
 
     @Resource
+    private com.dji.sikong.mapper.ZhimouImageDetectionMapper zhimouImageDetectionMapper;
+
+    @Resource
+    private com.dji.sikong.service.TaskSwitchService taskSwitchService;
+
+    @Resource
     private com.dji.sikong.mapper.FlightTaskMapper flightTaskMapper;
 
     @Resource
@@ -555,14 +561,45 @@ public class ApiController {
 
     @GetMapping("/alerts")
     public R<List<AlertDTO>> getAlerts() {
+        // 读取全局数据源开关: video(视频识别) / image(图片识别)
+        String dataSource = taskSwitchService.getAlertDataSource();
+        boolean imageMode = "image".equalsIgnoreCase(dataSource);
+
+        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+
+        if (imageMode) {
+            // 图片识别模式: 查 zhimou_image_detection 表, 只返回已清洗的
+            List<com.dji.sikong.entity.ZhimouImageDetection> imgResults = zhimouImageDetectionMapper.selectList(
+                    new LambdaQueryWrapper<com.dji.sikong.entity.ZhimouImageDetection>()
+                            .eq(com.dji.sikong.entity.ZhimouImageDetection::getDeleted, 0)
+                            .ne(com.dji.sikong.entity.ZhimouImageDetection::getCleanStatus, 0)
+                            .orderByDesc(com.dji.sikong.entity.ZhimouImageDetection::getEventTime)
+                            .last("LIMIT 50")
+            );
+            List<AlertDTO> imgList = imgResults.stream().map(r -> {
+                AlertDTO dto = new AlertDTO();
+                dto.setId(String.valueOf(r.getId()));
+                dto.setAppName("AI图片识别");
+                dto.setRuleName(r.getAppName() != null ? r.getAppName() : "未知规则");
+                dto.setAlarmTime(r.getEventTime() != null ? r.getEventTime().format(formatter) : "");
+                dto.setLevel("high");
+                if (r.getLocalImagePath() != null) {
+                    dto.setImageUrl("/api/zhimou-img/" + r.getLocalImagePath());
+                }
+                if (r.getLongitude() != null) dto.setLng(r.getLongitude().doubleValue());
+                if (r.getLatitude() != null) dto.setLat(r.getLatitude().doubleValue());
+                return dto;
+            }).collect(Collectors.toList());
+            return R.ok(imgList);
+        }
+
+        // 视频识别模式(默认): 查 zhimou_detection_result 表
         List<ZhimouDetectionResult> results = detectionResultMapper.selectList(
                 new LambdaQueryWrapper<ZhimouDetectionResult>()
                         .eq(ZhimouDetectionResult::getDeleted, 0)
                         .orderByDesc(ZhimouDetectionResult::getEventTime)
                         .last("LIMIT 50")
         );
-
-        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
         List<AlertDTO> result = results.stream().map(r -> {
             AlertDTO dto = new AlertDTO();

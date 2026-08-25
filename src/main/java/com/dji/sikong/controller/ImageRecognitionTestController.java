@@ -45,6 +45,10 @@ public class ImageRecognitionTestController {
     @Resource
     private ImageCleanupService imageCleanupService;
 
+    /** 二期新增: 数据源开关服务 */
+    @Resource
+    private com.dji.sikong.service.TaskSwitchService taskSwitchService;
+
     /**
      * 触发全流程: 扫描图片 → 知眸图片任务 + 自有模型识别
      * <p>
@@ -74,6 +78,11 @@ public class ImageRecognitionTestController {
 
         log.info("[图片识别测试] 开始 imageDir={}, imageBaseDir={}, aircraftSn={}, appId={}, runZhimou={}, runSelfModel={}",
                 imageDir, imageBaseDir, aircraftSn, appId, runZhimou, runSelfModel);
+
+        // ⭐ 二期新增: 检查图片识别任务开关
+        if (!taskSwitchService.isImageTaskEnabled()) {
+            return R.fail("图片识别任务已关闭, 请在 admin 换数据源页面开启 image_task 开关");
+        }
 
         // 1. 扫描图片目录
         File dir = new File(imageDir);

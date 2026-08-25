@@ -55,6 +55,10 @@
             <el-icon><Tools /></el-icon>
             <span>算法配置</span>
           </el-menu-item>
+          <el-menu-item index="/data-source">
+            <el-icon><Connection /></el-icon>
+            <span>换数据源</span>
+          </el-menu-item>
           <el-menu-item index="/workorder">
             <el-icon><Tickets /></el-icon>
             <span>工单管理</span>

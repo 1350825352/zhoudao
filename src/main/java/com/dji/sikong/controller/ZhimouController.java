@@ -29,6 +29,14 @@ import java.util.*;
 @RequestMapping("/zhimou")
 public class ZhimouController {
 
+    /** 二期新增: 数据源开关服务 */
+    @javax.annotation.Resource
+    private com.dji.sikong.service.TaskSwitchService taskSwitchService;
+
+    /** 二期新增: 知眸图片识别 Mapper */
+    @javax.annotation.Resource
+    private com.dji.sikong.mapper.ZhimouImageDetectionMapper zhimouImageDetectionMapper;
+
     @Resource
     private ZhimouTaskService zhimouTaskService;
 
@@ -243,6 +251,9 @@ public class ZhimouController {
 
     // =================================================================
     // 三、给前端用: 报警识别结果查询
+    // ⭐ 二期改造: 根据全局开关 alert_data_source 切换数据源
+    //    video  → 查 zhimou_detection_result 表(一期视频识别)
+    //    image  → 查 zhimou_image_detection 表(二期图片识别, 只返回已清洗 clean_status != 0)
     // =================================================================
 
     /**
@@ -252,12 +263,34 @@ public class ZhimouController {
     public R<List<Map<String, Object>>> latestResults(
             @RequestParam(value = "aircraft_sn", required = false) String aircraftSn,
             @RequestParam(value = "limit", defaultValue = "50") int limit) {
+        String ds = taskSwitchService.getAlertDataSource();
+        if ("image".equals(ds)) {
+            return R.ok(latestImageResults(aircraftSn, limit));
+        }
         List<ZhimouDetectionResult> list = zhimouTaskService.listLatestResults(aircraftSn, limit);
         List<Map<String, Object>> vo = new ArrayList<>();
         for (ZhimouDetectionResult dr : list) {
             vo.add(buildResultVO(dr));
         }
         return R.ok(vo);
+    }
+
+    /** 二期新增: 图片识别数据源(只返回已清洗的) */
+    private List<Map<String, Object>> latestImageResults(String aircraftSn, int limit) {
+        com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<com.dji.sikong.entity.ZhimouImageDetection> qw =
+                new com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<>();
+        qw.ne(com.dji.sikong.entity.ZhimouImageDetection::getCleanStatus, 0);
+        if (StrUtil.isNotBlank(aircraftSn)) {
+            qw.eq(com.dji.sikong.entity.ZhimouImageDetection::getDeviceId, aircraftSn);
+        }
+        qw.orderByDesc(com.dji.sikong.entity.ZhimouImageDetection::getEventTime);
+        qw.last("LIMIT " + Math.max(1, Math.min(limit, 500)));
+        List<com.dji.sikong.entity.ZhimouImageDetection> list = zhimouImageDetectionMapper.selectList(qw);
+        List<Map<String, Object>> vo = new ArrayList<>();
+        for (com.dji.sikong.entity.ZhimouImageDetection img : list) {
+            vo.add(buildImageResultVO(img));
+        }
+        return vo;
     }
 
     /**
@@ -275,6 +308,10 @@ public class ZhimouController {
             @RequestParam(value = "end_time", required = false) String endTime,
             @RequestParam(value = "page", defaultValue = "1") int page,
             @RequestParam(value = "size", defaultValue = "20") int size) {
+        String ds = taskSwitchService.getAlertDataSource();
+        if ("image".equals(ds)) {
+            return R.ok(pageImageResults(aircraftSn, page, size));
+        }
         Page<ZhimouDetectionResult> resultPage = zhimouTaskService.pageResults(aircraftSn, ruleId, ruleName, deviceName, routeName, status, startTime, endTime, page, size);
         List<Map<String, Object>> vo = new ArrayList<>();
         for (ZhimouDetectionResult dr : resultPage.getRecords()) {
@@ -286,6 +323,56 @@ public class ZhimouController {
         res.put("page", resultPage.getCurrent());
         res.put("size", resultPage.getSize());
         return R.ok(res);
+    }
+
+    /** 二期新增: 图片识别分页查询(只返回已清洗的) */
+    private Map<String, Object> pageImageResults(String aircraftSn, int page, int size) {
+        com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<com.dji.sikong.entity.ZhimouImageDetection> qw =
+                new com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<>();
+        qw.ne(com.dji.sikong.entity.ZhimouImageDetection::getCleanStatus, 0);
+        if (StrUtil.isNotBlank(aircraftSn)) {
+            qw.eq(com.dji.sikong.entity.ZhimouImageDetection::getDeviceId, aircraftSn);
+        }
+        qw.orderByDesc(com.dji.sikong.entity.ZhimouImageDetection::getEventTime);
+        Page<com.dji.sikong.entity.ZhimouImageDetection> p = new Page<>(page, size);
+        Page<com.dji.sikong.entity.ZhimouImageDetection> resultPage = zhimouImageDetectionMapper.selectPage(p, qw);
+        List<Map<String, Object>> vo = new ArrayList<>();
+        for (com.dji.sikong.entity.ZhimouImageDetection img : resultPage.getRecords()) {
+            vo.add(buildImageResultVO(img));
+        }
+        Map<String, Object> res = new LinkedHashMap<>();
+        res.put("list", vo);
+        res.put("total", resultPage.getTotal());
+        res.put("page", resultPage.getCurrent());
+        res.put("size", resultPage.getSize());
+        return res;
+    }
+
+    /** 二期新增: 图片识别 VO (字段统一, 前端无感知) */
+    private Map<String, Object> buildImageResultVO(com.dji.sikong.entity.ZhimouImageDetection img) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("id", img.getId());
+        m.put("zhimou_task_id", img.getZhimouTaskId());
+        m.put("aircraft_sn", img.getDeviceId() != null ? img.getDeviceId() : "");
+        m.put("rule_id", img.getAppId() != null ? img.getAppId() : "");
+        m.put("rule_name", img.getAppName() != null ? img.getAppName() : "");
+        m.put("hit_count", img.getHitCount() != null ? img.getHitCount() : 0);
+        m.put("event_time", img.getEventTime());
+        m.put("event_timestamp_ms", img.getEventTimestampMs());
+        m.put("latitude", img.getLatitude());
+        m.put("longitude", img.getLongitude());
+        m.put("height", img.getAltitude());
+        // 图片URL: 优先使用本地保存的图片路径
+        m.put("image_http_url", zhimouTaskService.buildImageHttpUrl(img.getLocalImagePath()));
+        m.put("image_has_osd", img.getLatitude() != null ? 1 : 0);
+        m.put("image_width", img.getImageWidth());
+        m.put("image_height", img.getImageHeight());
+        m.put("wayline_uuid", "");
+        m.put("work_order_id", null);
+        m.put("local_image_name", img.getLocalImageName());
+        m.put("clean_status", img.getCleanStatus());
+        m.put("data_source", "image");
+        return m;
     }
 
     private Map<String, Object> buildResultVO(ZhimouDetectionResult dr) {

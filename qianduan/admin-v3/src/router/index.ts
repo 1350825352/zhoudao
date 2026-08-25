@@ -68,6 +68,12 @@ const routes: RouteRecordRaw[] = [
         name: 'Algorithm',
         component: () => import('@/views/algorithm/index.vue'),
         meta: { title: '算法配置', icon: 'Settings' }
+      },
+      {
+        path: 'data-source',
+        name: 'DataSource',
+        component: () => import('@/views/data-source/index.vue'),
+        meta: { title: '换数据源', icon: 'Switch' }
       }
     ]
   }
