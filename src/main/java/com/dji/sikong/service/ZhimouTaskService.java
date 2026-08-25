@@ -131,6 +131,24 @@ public interface ZhimouTaskService extends IService<ZhimouTask> {
     /** 图片任务: 上报一张图片(对应 /api/task/{taskId}/image) */
     JsonNode reportImage(String zhimouTaskId, long imageId, String aircraftSn, byte[] imageBytes);
 
+    /**
+     * 图片识别任务(长期模式): 创建一个任务 → 批量上报图片 → 关闭任务(后续手动)
+     * 本地测试阶段: 每张图片用文件名去掉扩展名作为 local_image_name,
+     *   用 imageId(递增long) 关联回调 frame.id;
+     *   GPS 经纬度从 EXIF 提取后存 Redis Hash, handleCallback 时反查.
+     * @param imageFiles 待识别的图片文件列表
+     * @param aircraftSn 设备号(飞机SN, 本地测试可用占位SN)
+     * @param appId 知眸应用ID(逗号分隔多app)
+     * @param applicationPackageId 知眸应用包ID
+     * @param imageBaseDir 图片落盘本地基目录(如 H:/traeproject/zhoudao/zhimou-images)
+     * @return taskId, 失败返回null
+     */
+    String createAndReportImageBatch(java.util.List<java.io.File> imageFiles,
+                                     String aircraftSn,
+                                     String appId,
+                                     String applicationPackageId,
+                                     String imageBaseDir);
+
     /** 健康检查用: 查询当前活跃的码流(开启中/已开启) */
     List<LiveStream> listActiveLiveStreamsNeedZhimou();
 

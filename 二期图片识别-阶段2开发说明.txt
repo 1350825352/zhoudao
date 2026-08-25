@@ -1,0 +1,289 @@
+================================================================================
+产品二期: 数据源开关 + 警情切换 - 阶段2开发说明
+================================================================================
+开发日期: 2026-08-25
+开发目标: admin 页面数据源管理 + 视频任务开关 + 图片识别开关 + 警情数据源切换
+状态: 待开发
+================================================================================
+
+
+一、需求概述
+--------------------------------------------------------------------------------
+在一期代码基础上进行改造, 在 admin-v3 左侧菜单栏新增"换数据源"目录,
+集中管理以下三个开关/切换:
+
+1. 视频流任务开关: 开启/关闭知眸视频流自动创建任务
+2. 图片识别任务开关: 开启/关闭图片识别流程
+3. 警情数据源切换: 切换警情信息显示的数据源(视频识别/图片识别已清洗)
+
+
+二、关键决策确认
+--------------------------------------------------------------------------------
+决策1: 视频任务开关关闭时
+  用户选择: 方案B - 立即关闭所有运行中的视频任务
+  (不等自然结束, 立即遍历 zhimou_status=1 的 live_stream 调用 closeZhimouTaskByLiveStreamId)
+
+决策2: 图片识别数据源显示
+  用户选择: 只显示 clean_status != 0 的已清洗数据
+  (避免脏数据展示给前端)
+
+决策3: 警情数据源切换范围
+  用户选择: 全局切换
+  (目前只有一个机场, admin 设置后所有用户看到同样的数据源)
+
+决策4: 图片识别任务开关
+  用户选择: 当前控制测试入口, MinIO 接入后控制事件接收接口
+
+决策5: 切换按钮位置
+  用户选择: 只在 admin-v3 左侧"换数据源"菜单
+  (screen-v3 无需切换按钮, 自动读取全局设置)
+
+
+三、数据库设计
+--------------------------------------------------------------------------------
+3.1 新建表 task_switch_config
+
+  字段          类型           说明
+  ------------ ------------- ---------------------------------------------------
+  id           BIGINT        主键
+  switch_key   VARCHAR(32)   开关键名: video_task / image_task / alert_data_source
+  value        VARCHAR(16)   开关值: video_task/image_task 为 0/1;
+                              alert_data_source 为 video/image
+  update_time  DATETIME      最后修改时间
+  updater      VARCHAR(64)   操作人
+
+3.2 初始化数据
+
+  switch_key             value    说明
+  ---------------------- -------- ----------------------------
+  video_task             1        视频流任务默认开启
+  image_task             0        图片识别任务默认关闭
+  alert_data_source      video     警情数据源默认视频识别
+
+3.3 SQL 文件位置
+  sql/task_switch_config.sql
+
+
+四、后端实现
+--------------------------------------------------------------------------------
+4.1 新增文件
+
+  [Entity]  TaskSwitchConfig.java
+            - 开关配置实体类
+
+  [Mapper]  TaskSwitchConfigMapper.java
+            - extends BaseMapper<TaskSwitchConfig>
+
+  [Service] TaskSwitchService.java
+            - getSwitchValue(key): 从 Redis 读取, 未命中查数据库
+            - setSwitchValue(key, value): 更新数据库 + 更新 Redis
+            - isVideoTaskEnabled(): 快捷方法, 返回 boolean
+            - isImageTaskEnabled(): 快捷方法, 返回 boolean
+            - getAlertDataSource(): 快捷方法, 返回 "video"/"image"
+
+  [Controller] TaskSwitchController.java
+            - GET  /api/task-switch          查询所有开关状态
+            - PUT  /api/task-switch/{key}    修改开关状态
+
+4.2 Redis 缓存设计
+
+  Key                             Value        TTL
+  ------------------------------ ------------ -----
+  switch:video_task              0/1          永久
+  switch:image_task              0/1          永久
+  switch:alert_data_source       video/image  永久
+
+  用途: 每秒调度时高频检查, 避免频繁查库
+
+4.3 视频任务开关逻辑
+
+  修改文件: ZhimouTaskServiceImpl.java
+
+  修改位置: autoCheckLiveStreams() 方法 (L122)
+
+  逻辑:
+    @Scheduled(fixedDelay = 1000L)
+    public void autoCheckLiveStreams() {
+        // 检查视频任务开关
+        if (!taskSwitchService.isVideoTaskEnabled()) {
+            // 开关关闭: 立即关闭所有运行中的知眸视频任务
+            List<LiveStream> runningStreams = liveStreamMapper.selectList(
+                new LambdaQueryWrapper<LiveStream>()
+                    .eq(LiveStream::getZhimouStatus, 1)
+                    .eq(LiveStream::getDeleted, 0));
+            for (LiveStream live : runningStreams) {
+                closeZhimouTaskByLiveStreamId(live.getId());
+            }
+            return; // 不再创建新任务
+        }
+        // 原有逻辑...
+    }
+
+  关键行为:
+    - 关闭开关: 立即关闭所有 zhimou_status=1 的视频任务 + 停止自动创建
+    - 开启开关: 恢复自动调度
+
+4.4 图片识别任务开关逻辑
+
+  修改文件: ImageRecognitionTestController.java
+
+  修改位置: /run 接口
+
+  逻辑:
+    if (!taskSwitchService.isImageTaskEnabled()) {
+        return R.fail("图片识别任务已关闭, 请在admin换数据源页面开启");
+    }
+
+  后续 MinIO 接入后:
+    - MinIO 事件接收接口也检查此开关
+    - 关闭时忽略所有 MinIO 事件
+
+4.5 警情查询接口改造
+
+  修改文件: ZhimouController.java
+
+  修改位置: L244-L355 (getLatest, getPage, getById)
+
+  逻辑:
+    - 读取全局开关 switch:alert_data_source
+    - value=video (默认): 查 zhimou_detection_result 表
+    - value=image: 查 zhimou_image_detection 表, 条件 clean_status != 0
+    - 返回 VO 字段统一 (前端无感知)
+
+  同时修改 /alerts 接口 (screen-v3 调用):
+    - 后端内部读取全局开关, 决定查哪张表
+    - 前端无需传 source 参数, 无需感知切换
+
+
+五、前端 admin-v3 实现
+--------------------------------------------------------------------------------
+5.1 新增页面 src/views/data-source/index.vue
+
+  页面内容:
+  ┌─────────────────────────────────────────┐
+  │  换数据源                                │
+  ├─────────────────────────────────────────┤
+  │  视频流任务开关:  [开启] [关闭]          │
+  │  图片识别任务开关: [开启] [关闭]          │
+  │  警情数据源:      [视频识别] [图片识别]   │
+  └─────────────────────────────────────────┘
+
+  组件:
+    - 三个 el-switch / el-radio-group
+    - 修改时调用 PUT /api/task-switch/{key}
+    - 页面加载时调用 GET /api/task-switch 获取当前状态
+
+5.2 新增路由 src/router/index.ts
+
+  {
+    path: '/data-source',
+    name: 'DataSource',
+    component: () => import('@/views/data-source/index.vue'),
+    meta: { title: '换数据源', icon: '...' }
+  }
+
+5.3 新增菜单项 src/layout/index.vue
+
+  在 el-menu 中新增:
+    <el-menu-item index="/data-source">
+      <el-icon><.../></el-icon>
+      <span>换数据源</span>
+    </el-menu-item>
+
+5.4 新增 API 调用 src/api/
+
+  - getTaskSwitch()         → GET /api/task-switch
+  - updateTaskSwitch(key, value) → PUT /api/task-switch/{key}
+
+
+六、前端 screen-v3
+--------------------------------------------------------------------------------
+  无需改动
+
+  原因: 后端 /alerts 接口内部读取全局开关, 自动路由到正确的表
+  screen-v3 警情页面 (dangerSum.vue) 调用 /alerts 接口, 无需感知数据源切换
+
+
+七、改造范围清单
+--------------------------------------------------------------------------------
+类型    文件                                          说明
+------  --------------------------------------------  ----------------------
+新增SQL sql/task_switch_config.sql                   建表 + 初始化数据
+新增Entity TaskSwitchConfig.java                    开关配置实体
+新增Mapper TaskSwitchConfigMapper.java             开关配置 Mapper
+新增Service TaskSwitchService.java                  开关服务(含Redis缓存)
+新增Controller TaskSwitchController.java            开关管理接口
+修改Service ZhimouTaskServiceImpl.java             自动调度加开关检查+立即关闭
+修改Controller ZhimouController.java                警情查询加数据源切换
+修改Controller ImageRecognitionTestController.java 测试入口加开关检查
+新增前端  admin-v3/src/views/data-source/index.vue  数据源管理页面
+修改前端  admin-v3/src/router/index.ts              新增路由
+修改前端  admin-v3/src/layout/index.vue             新增菜单项
+修改前端  admin-v3/src/api/*.ts                     新增开关管理API
+
+
+八、交互流程
+--------------------------------------------------------------------------------
+8.1 视频任务开关流程
+
+  admin "换数据源" → 点击"视频流任务开关: 关闭"
+    ↓
+  PUT /api/task-switch/video_task?value=0
+    ↓
+  后端: 更新数据库 + 更新 Redis(switch:video_task=0)
+    ↓
+  下一秒调度时:
+    autoCheckLiveStreams() 读 Redis → video_task=0
+    ↓
+    立即关闭所有 zhimou_status=1 的视频任务
+    后续不再创建新任务
+
+8.2 警情数据源切换流程
+
+  admin "换数据源" → 切换警情数据源为"图片识别"
+    ↓
+  PUT /api/task-switch/alert_data_source?value=image
+    ↓
+  后端: 更新数据库 + 更新 Redis(switch:alert_data_source=image)
+    ↓
+  screen-v3 警情页面轮询 /alerts:
+    后端读 Redis → alert_data_source=image
+    ↓
+    查 zhimou_image_detection WHERE clean_status != 0
+    ↓
+    返回图片识别结果(已清洗)
+
+
+九、文件位置速查
+--------------------------------------------------------------------------------
+- 知眸配置:        src/main/resources/application-company-a.yml (L65-76)
+- 自动调度入口:    ZhimouTaskServiceImpl.java (L122)
+- 警情查询接口:    ZhimouController.java (L244-L355)
+- 图片测试入口:    ImageRecognitionTestController.java
+- admin-v3 路由:   qianduan/admin-v3/src/router/index.ts
+- admin-v3 布局:   qianduan/admin-v3/src/layout/index.vue
+- screen-v3 警情:  qianduan/screen-v3/src/views/home/dangerSum.vue
+- screen-v3 API:   qianduan/screen-v3/src/api/uav.ts
+
+
+十、测试验证清单
+--------------------------------------------------------------------------------
+[ ] 数据库 task_switch_config 表创建成功, 初始化3条数据
+[ ] GET /api/task-switch 返回3个开关状态
+[ ] PUT /api/task-switch/video_task?value=0 关闭视频任务
+[ ] 关闭视频任务后, 所有 zhimou_status=1 的 live_stream 被关闭
+[ ] 开启视频任务后, 自动调度恢复正常
+[ ] PUT /api/task-switch/image_task?value=1 开启图片识别
+[ ] 图片识别开启后, /test/image-recognition/run 可以正常调用
+[ ] 图片识别关闭后, /test/image-recognition/run 返回提示
+[ ] PUT /api/task-switch/alert_data_source?value=image 切换警情数据源
+[ ] screen-v3 警情页面显示图片识别结果(已清洗)
+[ ] PUT /api/task-switch/alert_data_source?value=video 切换回视频识别
+[ ] screen-v3 警情页面恢复显示视频识别结果
+[ ] admin-v3 左侧菜单显示"换数据源"菜单项
+[ ] admin-v3 "换数据源"页面显示3个开关/切换
+
+
+================================================================================
+文档结束
+================================================================================

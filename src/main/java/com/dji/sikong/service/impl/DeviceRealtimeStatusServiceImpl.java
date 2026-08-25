@@ -275,10 +275,35 @@ if (data.has("flighttask_step_code")) status.setFlightStepCode(data.get("flightt
             status.setOsdRawJson(osdNode.toString());
         } catch (Exception ignore) {}
 
+        // 显式设置update_time, 因为strictUpdateFill不覆盖已有值
+        status.setUpdateTime(java.time.LocalDateTime.now());
+
         if (exist == null) {
             statusMapper.insert(status);
         } else {
             statusMapper.updateById(status);
+        }
+
+        // 如果当前OSD是机场消息但解析出了飞机SN和mode_code, 同步更新飞机的status
+        if (StrUtil.isNotBlank(realAircraftSn) && !realAircraftSn.equals(deviceSn) && modeCode != null) {
+            try {
+                DeviceRealtimeStatus aircraftStatus = statusMapper.selectOne(
+                        new LambdaQueryWrapper<DeviceRealtimeStatus>().eq(DeviceRealtimeStatus::getDeviceSn, realAircraftSn));
+                if (aircraftStatus != null) {
+                    // 只有飞机的update_time超过30秒才更新(避免高频覆盖飞机自己的OSD数据)
+                    boolean stale = aircraftStatus.getUpdateTime() == null
+                            || aircraftStatus.getUpdateTime().isBefore(java.time.LocalDateTime.now().minusSeconds(30));
+                    if (stale) {
+                        aircraftStatus.setDeviceMode(modeCode);
+                        aircraftStatus.setUpdateTime(java.time.LocalDateTime.now());
+                        statusMapper.updateById(aircraftStatus);
+                        System.out.println("[OSD-飞机状态同步] 从机场OSD同步飞机 mode_code=" + modeCode
+                                + " 到飞机=" + realAircraftSn + " (飞机自己OSD超时未更新)");
+                    }
+                }
+            } catch (Exception e) {
+                System.out.println("[OSD-飞机状态同步] 失败: " + e.getMessage());
+            }
         }
 
         // 缓存

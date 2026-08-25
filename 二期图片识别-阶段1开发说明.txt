@@ -1,0 +1,323 @@
+================================================================================
+产品二期: 图片识别方案 - 阶段1开发说明
+================================================================================
+开发日期: 2026-08-25
+开发目标: 知眸图片识别 + 自有模型识别 + 数据清洗 (本地测试版)
+状态: ✅ 已通过本地测试验证
+================================================================================
+
+
+一、方案概述
+--------------------------------------------------------------------------------
+基于"知眸视频与图片任务完全解耦"的设计原则, 实现二期图片识别方案:
+- 知眸图片任务: 异步创建任务 → 上报图片 → 等待回调 → 入库
+- 自有模型识别: 同步调用 /api/v1/detect → 立即返回 → 入库
+- 数据清洗: 同一张图片两边都有识别结果且目标位置匹配 → 判定为误识别
+
+数据流:
+  testimage 目录扫描 (后续替换为 MinIO 事件)
+    ↓ 后端下载图片字节
+    ├─→ 知眸: POST /api/task (创建) → POST /api/task/{id}/image (上报) → 异步回调 → 入 zhimou_image_detection
+    └─→ 自有模型: POST /api/v1/detect (同步) → 入 self_model_image_detection
+    ↓
+  Redis 元数据反查 (taskId, frame.id) → local_image_name + GPS
+    ↓
+  数据清洗服务 → 中心点距离匹配 → 标记 clean_status (0/1/2)
+
+
+二、数据库变更
+--------------------------------------------------------------------------------
+2.1 新建表 (已执行到 192.168.2.200:3306/sikong_cloud_api)
+
+表1: zhimou_image_detection (知眸图片识别结果表)
+  - 32 个字段, 7 个索引
+  - 关键字段: zhimou_task_id, local_image_name, frame_id, hit_count,
+              targets_json, latitude/longitude/altitude, callback_event,
+              clean_status, clean_time, clean_remark
+  - 索引: zhimou_task_id, local_image_name, device_id, event_time, clean_status, latitude, longitude
+
+表2: self_model_image_detection (自有模型识别结果表)
+  - 30 个字段, 6 个索引
+  - 关键字段: request_id, local_image_name, call_status, hit_count,
+              targets_json, latitude/longitude/altitude, model_version,
+              clean_status, clean_time, clean_remark
+  - 索引: request_id, local_image_name, model_version, call_time, clean_status, latitude, longitude
+
+2.2 修改表 (已执行)
+
+表: zhimou_task
+  - live_stream_id 字段: NOT NULL → DEFAULT NULL (图片任务无直播流)
+
+2.3 SQL 文件位置
+  - 建表脚本: sql/image_detection_tables.sql
+  - 升级脚本: sql/upgrade_add_gps_fields.sql (GPS 字段升级)
+
+
+三、新增文件清单
+--------------------------------------------------------------------------------
+3.1 Entity 实体类
+  src/main/java/com/dji/sikong/entity/ZhimouImageDetection.java
+    - 知眸图片识别表实体 (32 字段对应)
+  src/main/java/com/dji/sikong/entity/SelfModelImageDetection.java
+    - 自有模型识别表实体 (30 字段对应)
+
+3.2 Mapper 接口
+  src/main/java/com/dji/sikong/mapper/ZhimouImageDetectionMapper.java
+    - extends BaseMapper<ZhimouImageDetection>
+  src/main/java/com/dji/sikong/mapper/SelfModelImageDetectionMapper.java
+    - extends BaseMapper<SelfModelImageDetection>
+
+3.3 Service 服务类
+  src/main/java/com/dji/sikong/service/SelfModelDetectService.java
+    - 自有模型同步调用 + 入库
+    - 服务器: http://192.168.2.200:5173/api/v1/detect
+    - 超时: 5000ms
+    - 入参: imageFile, threshold, imageBaseDir
+    - 出参: SelfModelImageDetection (已入库)
+    - 流程: 落盘 → EXIF GPS → 调用 API → 解析响应 → 入库
+
+  src/main/java/com/dji/sikong/service/ImageCleanupService.java
+    - 数据清洗算法 (核心)
+    - DEFAULT_DISTANCE_THRESHOLD = 50.0 像素
+    - cleanupSingleImage(localImageName): 清洗单张
+    - cleanupAllPending(): 批量清洗所有 clean_status=0
+    - 算法:
+      情况A: 两边都有结果 + 所有目标位置匹配 → 误识别(2)
+      情况B: 只知眸有结果 → 正常(1)
+      情况C: 只自有模型有结果 → 正常(1)
+    - 中心点提取:
+      知眸: bbox {x, y} → center=(x, y)  [待实测确认含义]
+      自有: bbox {x1,y1,x2,y2} → center=((x1+x2)/2, (y1+y2)/2)
+
+3.4 Controller 测试入口
+  src/main/java/com/dji/sikong/controller/ImageRecognitionTestController.java
+    - @RequestMapping("/test/image-recognition")
+    - 4 个接口 (见下方接口清单)
+
+3.5 工具类
+  src/main/java/com/dji/sikong/common/ImageExifUtil.java
+    - EXIF GPS 提取工具
+    - extractGps(File): 返回 BigDecimal[3] = {lat, lon, alt}
+    - 依赖: metadata-extractor 2.19.0 (pom.xml 已加)
+
+3.6 SQL 脚本
+  sql/image_detection_tables.sql           - 两表完整建表脚本
+  sql/upgrade_add_gps_fields.sql           - GPS 字段升级脚本
+
+
+四、修改文件清单
+--------------------------------------------------------------------------------
+4.1 pom.xml
+  - 新增依赖: com.drewnoaa:metadata-extractor:2.19.0 (EXIF GPS 提取)
+  - 新增编码声明: project.build.sourceEncoding=UTF-8 等 (解决中文乱码)
+
+4.2 ZhimouOpenApiClient.java (知眸 API 客户端)
+  - 修复 reportImage() 方法 3 处错误:
+    错误1: 参数名 id → image_id (文档要求)
+    错误2: 参数名 device → device_id (文档要求)
+    错误3: .form(query) 改为 URL query 拼接 + Body 二进制流
+  - 新增请求/响应日志输出
+
+4.3 ZhimouTaskServiceImpl.java (知眸任务服务)
+  - 修复 createImageTask() 4 处字段错误:
+    错误1: app_id → app_ids (数组, 支持多应用)
+    错误2: application_package_id → zapk_id
+    错误3: device → device_id
+    错误4: 嵌套 report.httpurl → 顶层 report_url
+  - 新增 createAndReportImageBatch() 方法:
+    批量上报图片, 每次间隔 1 秒 (知眸限流要求)
+    image_id 从 1 开始, 回调 frame.id 原样返回
+    Redis meta key: zhimou:img:meta:{taskId}:{imageId}
+  - 新增 handleImageCallback() 方法:
+    图片回调分流处理 (区别于视频回调)
+    用 frame.id 反查 Redis 元数据 (local_image_name, GPS)
+    入 zhimou_image_detection 表
+
+4.4 application-company-a.yml (配置文件)
+  注意: src/main/resources/ 和 deploy-package/ 两份配置需同步
+  - appsecret 更新为正确值: gdKfyFDy39L494HGVwlkWdLKlID9Syc3
+  - 关键配置:
+    zhimou.openapi.base-url: http://192.168.2.202:10042
+    zhimou.openapi.callback-url: http://192.168.2.130:8080/api/zhimou/callback
+    zhimou.openapi.default-app-id: "3y14nhqxbd,napvhsbecn" (人员+小客车识别)
+    zhimou.openapi.default-pkg-id: "par579tq"
+    zhimou.image.save-root-dir: H:/traeproject/ceshisikongapiAI/zhimou-images
+
+
+五、接口清单
+--------------------------------------------------------------------------------
+5.1 测试入口 (ImageRecognitionTestController)
+
+  [POST] /api/test/image-recognition/run
+    功能: 扫描 testimage 目录, 触发知眸+自有模型识别
+    入参 (JSON body, 可选):
+      {
+        "appId": "3y14nhqxbd,napvhsbecn",      // 知眸应用ID, 默认用配置
+        "applicationPackageId": "par579tq",    // 知眸应用包ID, 默认用配置
+        "threshold": 0.5,                      // 自有模型置信度阈值
+        "runZhimou": true,                     // 是否跑知眸
+        "runSelfModel": true                   // 是否跑自有模型
+      }
+    出参:
+      {
+        "code": 200, "success": true,
+        "data": {
+          "imageCount": 16,
+          "zhimouTaskId": "1585674774822387024",
+          "selfModelSuccess": 16,
+          "selfModelFail": 0,
+          "cleanupHint": "知眸异步回调约28秒/张, 待回调到齐后调用..."
+        }
+      }
+
+  [POST] /api/test/image-recognition/cleanup?localImageName=xxx
+    功能: 清洗单张图片
+    出参: {"code":200, "data":"误识别(知眸1个目标全部匹配自有模型)"}
+    或:   {"code":200, "data":"正常识别(知眸1个目标, 自有模型0个目标)"}
+
+  [POST] /api/test/image-recognition/cleanup-all
+    功能: 批量清洗所有 clean_status=0 的图片
+    出参: {"code":200, "data":16}  (清洗了16张)
+
+  [POST] /api/test/image-recognition/close?taskId=xxx
+    功能: 关闭知眸图片任务 (测试完成后调用)
+
+5.2 知眸回调接口 (已有, 复用)
+  [POST] /api/zhimou/callback
+    - 知眸异步回调到这里
+    - handleCallback() 内部按 zhimouTask.mode 分流:
+      mode=video → handleVideoCallback() → zhimou_detection_result 表
+      mode=image → handleImageCallback() → zhimou_image_detection 表
+
+
+六、关键技术决策
+--------------------------------------------------------------------------------
+6.1 知眸图片任务字段 (与视频任务不同)
+  - app_ids (数组, 非单值 app_id)
+  - zapk_id (非 application_package_id)
+  - device_id (非 device)
+  - report_url (顶层, 非嵌套 report.httpurl)
+
+6.2 知眸图片上报 (image_id 关联机制)
+  - 接口: POST /api/task/{task_id}/image?image_id=xxx&device_id=xxx
+  - Body: application/octet-stream (二进制流)
+  - 限制: 每任务最小上报间隔 1 秒
+  - 关键: image_id 会在回调 data.frame.id 原样返回
+
+6.3 Redis 元数据反查机制
+  - 上报前: 写入 Redis Hash
+    key: zhimou:img:meta:{taskId}:{imageId}
+    value: {local_image_name, local_image_path, latitude, longitude, altitude}
+    TTL: 24小时
+  - 回调时: 用 frame.id 反查
+    frame.id = image_id (知眸原样返回)
+    meta key: zhimou:img:meta:{taskId}:{frame.id}
+
+6.4 数据清洗算法
+  - 误识别判定: 同一张图片两边都有识别结果 + 所有目标位置匹配 → 误识别
+  - 位置匹配: bbox 中心点距离 < 50 像素 (DEFAULT_DISTANCE_THRESHOLD)
+  - 知眸 bbox: {x, y} → 当前按"中心点"处理 (待实测确认)
+  - 自有模型 bbox: {x1,y1,x2,y2} → center=((x1+x2)/2, (y1+y2)/2)
+
+6.5 EXIF GPS 提取
+  - 用 metadata-extractor 库从图片 EXIF 提取 GPS 信息
+  - 同时存入两表, 方便后续按地理位置查询
+
+
+七、测试结果 (2026-08-25 14:05)
+--------------------------------------------------------------------------------
+7.1 知眸图片识别
+  - 上报: 16/16 全部成功 (1秒间隔, 无限流)
+  - 回调: 16 条 frame/message 事件全部到达
+  - frame.id: 1-16 正确对应 (原样返回 image_id)
+  - local_image_name: 16/16 正确填充
+  - GPS: 16/16 正确填充 (lat/lon/alt)
+  - 总命中目标: 6 个 (4张图片有命中)
+
+7.2 自有模型识别
+  - 调用: 16/16 全部成功 (同步, 约 300-500ms/张)
+  - local_image_name: 16/16 正确填充
+  - GPS: 16/16 正确填充
+  - 总命中目标: 2 个 (1张图片有命中, DJI_..._0011_V)
+
+7.3 数据清洗
+  - cleanup-all: 清洗了 16 张图片
+  - 知眸 clean_status 分布:
+    未清洗(0): 2条 (旧任务脏数据, local_image_name=NULL)
+    已清洗-正常(1): 15条
+    误识别(2): 1条 (DJI_..._0011_V)
+  - 自有模型 clean_status 分布:
+    已清洗-正常(1): 30条
+    误识别(2): 2条 (DJI_..._0011_V, 跑了两遍)
+  - 误识别判定正确: DJI_..._0011_V 两边都 hit=1 且位置匹配 → 误识别
+
+
+八、遗留问题与后续计划
+--------------------------------------------------------------------------------
+8.1 待确认/待优化
+  [1] 知眸 bbox {x, y} 含义待确认
+      - 当前按"中心点"处理, 实测可能需要调整为"左上角"或其他
+      - 代码位置: ImageCleanupService.extractZhimouCenters() L205
+
+  [2] 距离阈值 50 像素是否合适
+      - 1920x1080 分辨率下 50 像素约 2.6%, 可能太严
+      - 代码位置: ImageCleanupService.DEFAULT_DISTANCE_THRESHOLD L37
+
+  [3] 旧任务脏数据清理
+      - zhimou_image_detection 表有 2 条旧任务记录 (local_image_name=NULL)
+      - 建议手动 DELETE FROM zhimou_image_detection WHERE local_image_name IS NULL
+
+8.2 阶段2 待开发 (MinIO 接入)
+  [1] MinIO 事件接收接口 (POST /api/minio/notify)
+      - 监听 ObjectCreated 事件
+      - 替换当前 testimage 目录扫描逻辑
+      - 下游链路完全复用
+
+  [2] MinIO 配置
+      - 服务器地址/bucket/凭证 待确认
+      - 需要在 MinIO 服务器配置 notify_webhook
+
+  [3] 图片获取方式
+      - 后端 getObject 拉取图片字节流 (知眸不支持 URL 传参, 必须先落盘再上报)
+
+  [4] 异步分发机制
+      - @Async 独立线程池
+      - Redis 队列跟踪两边完成状态 (替代 image_recognition_job 调度表)
+
+
+九、配置文件位置速查
+--------------------------------------------------------------------------------
+- 知眸配置:    src/main/resources/application-company-a.yml (L65-76)
+              deploy-package/application-company-a.yml (L65-76)  [需同步]
+- 数据库配置:  src/main/resources/application-company-a.yml (L8-11)
+- Redis 配置:  src/main/resources/application-company-a.yml (L13-18)
+- 日志文件:    target/springboot_start.log
+- 测试图片:    testimage/ 目录 (16 张 DJI_*.jpeg)
+
+
+十、启动与测试命令速查
+--------------------------------------------------------------------------------
+# 启动后端 (PowerShell)
+$env:JAVA_TOOL_OPTIONS="-Dfile.encoding=UTF-8 -Dsun.jnu.encoding=UTF-8"
+chcp 65001
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+mvn spring-boot:run
+
+# 触发识别测试
+curl -X POST http://localhost:8080/api/test/image-recognition/run ^
+  -H "Content-Type: application/json" ^
+  -d "{\"appId\":\"3y14nhqxbd,napvhsbecn\",\"applicationPackageId\":\"par579tq\",\"threshold\":0.5,\"runZhimou\":true,\"runSelfModel\":true}"
+
+# 等知眸回调到齐后(约28秒/张), 批量清洗
+curl -X POST "http://localhost:8080/api/test/image-recognition/cleanup-all"
+
+# 清洗单张
+curl -X POST "http://localhost:8080/api/test/image-recognition/cleanup?localImageName=DJI_20260806165730_0011_V"
+
+# 关闭知眸任务
+curl -X POST "http://localhost:8080/api/test/image-recognition/close?taskId=1585674774822387024"
+
+
+================================================================================
+文档结束
+================================================================================

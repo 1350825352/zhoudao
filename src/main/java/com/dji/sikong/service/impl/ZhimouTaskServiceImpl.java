@@ -3,6 +3,7 @@ package com.dji.sikong.service.impl;
 import cn.hutool.core.codec.Base64;
 import cn.hutool.core.date.DateUtil;
 import cn.hutool.core.io.FileUtil;
+import com.dji.sikong.common.ImageExifUtil;
 import cn.hutool.core.util.IdUtil;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.http.HttpUtil;
@@ -17,6 +18,7 @@ import com.dji.sikong.entity.Device;
 import com.dji.sikong.entity.LiveStream;
 import com.dji.sikong.entity.Wayline;
 import com.dji.sikong.entity.ZhimouDetectionResult;
+import com.dji.sikong.entity.ZhimouImageDetection;
 import com.dji.sikong.entity.WorkOrder;
 import com.dji.sikong.entity.ZhimouTask;
 import com.dji.sikong.entity.ZhimouTaskConfig;
@@ -42,9 +44,14 @@ import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 import javax.imageio.ImageIO;
@@ -61,6 +68,10 @@ public class ZhimouTaskServiceImpl extends ServiceImpl<ZhimouTaskMapper, ZhimouT
 
     @Resource
     private ZhimouDetectionResultMapper detectionResultMapper;
+
+    /** 二期新增: 知眸图片识别结果表 Mapper */
+    @Resource
+    private com.dji.sikong.mapper.ZhimouImageDetectionMapper zhimouImageDetectionMapper;
 
     @Resource
     private LiveStreamMapper liveStreamMapper;
@@ -1074,6 +1085,15 @@ public class ZhimouTaskServiceImpl extends ServiceImpl<ZhimouTaskMapper, ZhimouT
             zhimouTask = this.getOne(new LambdaQueryWrapper<ZhimouTask>().eq(ZhimouTask::getAircraftSn, device).orderByDesc(ZhimouTask::getId).last("LIMIT 1"));
         }
 
+        // ============================================================
+        // ✅ 二期新增: 按 zhimouTask.mode 分流
+        //   mode=image → 写入 zhimou_image_detection 表 (二期图片识别)
+        //   其他(null/video) → 写入 zhimou_detection_result 表 (一期视频识别, 原逻辑)
+        // ============================================================
+        if (zhimouTask != null && "image".equalsIgnoreCase(zhimouTask.getMode())) {
+            return handleImageCallback(root, zhimouTask, rawJson, zhimouTaskId, businessId, device, eventTs);
+        }
+
         // ===== 1. 图片处理 =====
         String imageRelativePath = null;
         String imageFormat = "png";
@@ -1375,6 +1395,112 @@ public class ZhimouTaskServiceImpl extends ServiceImpl<ZhimouTaskMapper, ZhimouT
         pushAlertViaMqtt(dr);
 
         return dr;
+    }
+
+    // ================================================================
+    // 二期新增: 知眸图片任务回调处理 (写入 zhimou_image_detection 表)
+    // 通过 frame.id 关联回调时的 imageId, 从 Redis 反查元数据
+    // ================================================================
+    private ZhimouDetectionResult handleImageCallback(JsonNode root, ZhimouTask zhimouTask,
+                                                      String rawJson, String zhimouTaskId,
+                                                      String businessId, String device, long eventTs) {
+        // 1. 解析 frame.id (知眸 frame.id 从0开始递增, 按收图顺序)
+        JsonNode frameNode = root.path("data").path("frame");
+        long frameId = frameNode.path("id").asLong(-1);
+        if (frameId < 0) frameId = frameNode.path("image_id").asLong(-1);
+
+        // 2. 从 Redis 反查元数据 (local_image_name, local_image_path, lat, lon, alt)
+        //    key: zhimou:img:meta:{taskId}:{frameIdx}  (frameIdx 从0开始, 对应知眸 frame.id)
+        BigDecimal lat = null, lon = null, alt = null;
+        String localImageName = null, localImagePath = null;
+        if (frameId >= 0 && StrUtil.isNotBlank(zhimouTaskId)) {
+            String metaKey = "zhimou:img:meta:" + zhimouTaskId + ":" + frameId;
+            Map<Object, Object> meta = stringRedisTemplate.opsForHash().entries(metaKey);
+            Object nm = meta.get("local_image_name");
+            Object ip = meta.get("local_image_path");
+            localImageName = nm != null ? nm.toString() : null;
+            localImagePath = ip != null ? ip.toString() : null;
+            lat = parseBigDecimal(meta.get("latitude"));
+            lon = parseBigDecimal(meta.get("longitude"));
+            alt = parseBigDecimal(meta.get("altitude"));
+            log.info("[知眸-图片回调] 反查Redis meta key={}, frameId={}, localImageName={}, lat={}, lon={}, alt={}",
+                    metaKey, frameId, localImageName, lat, lon, alt);
+        } else {
+            log.warn("[知眸-图片回调] frame.id/image_id 解析失败, 无法反查元数据, 仅依赖回调内容入库");
+        }
+
+        // 3. 解析回调里的图片路径和宽高
+        String zhimouImagePath = frameNode.path("image").asText(null);
+        Integer imageWidth = frameNode.has("width") && frameNode.path("width").isNumber() ? frameNode.get("width").asInt() : null;
+        Integer imageHeight = frameNode.has("height") && frameNode.path("height").isNumber() ? frameNode.get("height").asInt() : null;
+        Long frameIdBox = frameId >= 0 ? frameId : null;
+        Integer frameEnhance = frameNode.has("enhance") && frameNode.path("enhance").isNumber() ? frameNode.get("enhance").asInt() : null;
+
+        // 4. 解析 apps[] → appId, appName, zhimouAppImage, targetsJson, totalHit
+        JsonNode appsNode = root.path("data").path("apps");
+        int totalHit = 0;
+        String targetsJsonStr = null;
+        String appId = null, appName = null, zhimouAppImage = null;
+        String zapkId = root.path("zapk_id").asText(null);
+        if (appsNode.isArray() && appsNode.size() > 0) {
+            JsonNode app0 = appsNode.get(0);
+            appId = app0.path("app_id").asText(null);
+            appName = app0.path("app_name").asText(null);
+            zhimouAppImage = app0.path("image").asText(null);
+            JsonNode objectsNode = app0.path("objects");
+            totalHit = (objectsNode != null && objectsNode.isArray()) ? objectsNode.size() : 0;
+            // targets_json 保留 apps[] 完整原文 (排错/审计)
+            targetsJsonStr = appsNode.toString();
+        }
+
+        // 5. 入库 zhimou_image_detection 表
+        ZhimouImageDetection rec = new ZhimouImageDetection();
+        rec.setZhimouTaskId(zhimouTaskId);
+        rec.setBusinessId(businessId);
+        rec.setZapkId(zapkId);
+        rec.setAppId(appId);
+        rec.setAppName(appName);
+        rec.setDeviceId(device);
+        rec.setLocalImageName(localImageName);
+        rec.setZhimouImagePath(zhimouImagePath);
+        rec.setZhimouAppImage(zhimouAppImage);
+        rec.setLocalImagePath(localImagePath);
+        rec.setImageWidth(imageWidth);
+        rec.setImageHeight(imageHeight);
+        rec.setFrameId(frameIdBox);
+        rec.setFrameEnhance(frameEnhance);
+        rec.setLatitude(lat);
+        rec.setLongitude(lon);
+        rec.setAltitude(alt);
+        rec.setHitCount(totalHit);
+        if (targetsJsonStr != null) rec.setTargetsJson(targetsJsonStr);
+        rec.setEventTimestampMs(eventTs);
+        rec.setEventTime(LocalDateTime.ofInstant(Instant.ofEpochMilli(eventTs), ZoneId.systemDefault()));
+        rec.setRawCallbackJson(rawJson);
+        rec.setCallbackEvent(root.path("event").asText(null));
+        rec.setCleanStatus(0); // 0=未清洗
+        zhimouImageDetectionMapper.insert(rec);
+        log.info("[知眸-图片回调] 入库成功 id={}, taskId={}, frameId={}, localImageName={}, hit={}, gps=({},{},{})",
+                rec.getId(), zhimouTaskId, frameIdBox, localImageName, totalHit,
+                lat != null ? lat.toPlainString() : "N/A",
+                lon != null ? lon.toPlainString() : "N/A",
+                alt != null ? alt.toPlainString() : "N/A");
+
+        // 6. TODO 二期任务9: 触发数据清洗 (ImageCleanupService 实现)
+
+        return null; // 图片表是另一个实体, 这里返回 null (与视频表返回类型兼容)
+    }
+
+    /** 字符串转 BigDecimal, 失败/空 返回null */
+    private BigDecimal parseBigDecimal(Object val) {
+        if (val == null) return null;
+        String s = val.toString().trim();
+        if (s.isEmpty() || "null".equals(s)) return null;
+        try {
+            return new BigDecimal(s);
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     /**
@@ -1886,12 +2012,14 @@ public class ZhimouTaskServiceImpl extends ServiceImpl<ZhimouTaskMapper, ZhimouT
         }
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("mode", "image");
-        body.put("app_id", appId);
-        if (StrUtil.isNotBlank(applicationPackageId)) body.put("application_package_id", applicationPackageId);
-        body.put("device", aircraftSn);
-        Map<String, Object> report = new LinkedHashMap<>();
-        report.put("httpurl", properties.getOpenapi().getCallbackUrl());
-        body.put("report", report);
+        // 错误1修复: app_id → app_ids 数组 (支持多应用ID, 逗号分隔)
+        body.put("app_ids", Arrays.asList(appId.split(",")));
+        // 错误2修复: application_package_id → zapk_id
+        if (StrUtil.isNotBlank(applicationPackageId)) body.put("zapk_id", applicationPackageId);
+        // 错误3修复: device → device_id
+        body.put("device_id", aircraftSn);
+        // 错误4修复: 嵌套 report.httpurl → 顶层 report_url
+        body.put("report_url", properties.getOpenapi().getCallbackUrl());
         JsonNode resp = zhimouOpenApiClient.createTask(body);
         if (resp == null) return null;
         String taskId = resp.path("task_id").asText(null);
@@ -1916,6 +2044,95 @@ public class ZhimouTaskServiceImpl extends ServiceImpl<ZhimouTaskMapper, ZhimouT
     @Override
     public JsonNode reportImage(String zhimouTaskId, long imageId, String aircraftSn, byte[] imageBytes) {
         return zhimouOpenApiClient.reportImage(zhimouTaskId, imageId, aircraftSn, imageBytes);
+    }
+
+    // ================================================================
+    // 图片识别任务(长期模式): 一次创建 + 批量上报 + 后续手动关闭
+    // ================================================================
+    @Override
+    public String createAndReportImageBatch(List<File> imageFiles,
+                                             String aircraftSn,
+                                             String appId,
+                                             String applicationPackageId,
+                                             String imageBaseDir) {
+        if (imageFiles == null || imageFiles.isEmpty()) {
+            log.warn("[知眸-图片批量上报] 图片列表为空");
+            return null;
+        }
+        // 1. 创建一个长期图片任务
+        String taskId = createImageTask(aircraftSn, appId, applicationPackageId);
+        if (StrUtil.isBlank(taskId)) {
+            log.error("[知眸-图片批量上报] 创建任务失败, 无法继续");
+            return null;
+        }
+        log.info("[知眸-图片批量上报] 创建任务成功 taskId={}, 待上报图片数={}", taskId, imageFiles.size());
+
+        // 2. 循环上报每张图片 (每次间隔1秒, 知眸限制每任务最小上报间隔1秒)
+        long imageId = 1L;
+        int success = 0, fail = 0;
+        // image_id 由调用方指定, 回调里原样返回为 data.frame.id (见接口文档)
+        // 所以 Redis meta key 直接用 imageId, 不需要 INCR
+
+        for (File srcFile : imageFiles) {
+            try {
+                // 2.1 落盘到 imageBaseDir/yyyyMMdd/{原文件名}
+                String dayDir = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd"));
+                Path targetDir = Paths.get(imageBaseDir, dayDir);
+                Files.createDirectories(targetDir);
+                Path targetPath = targetDir.resolve(srcFile.getName());
+                if (!targetPath.toFile().exists()) {
+                    Files.copy(srcFile.toPath(), targetPath, StandardCopyOption.REPLACE_EXISTING);
+                }
+
+                // 2.2 用文件名去掉扩展名作为 local_image_name
+                String fileName = srcFile.getName();
+                int dotIdx = fileName.lastIndexOf('.');
+                String localImageName = dotIdx > 0 ? fileName.substring(0, dotIdx) : fileName;
+
+                // 2.3 提取 EXIF GPS
+                BigDecimal[] gps = ImageExifUtil.extractGps(srcFile);
+                BigDecimal lat = gps[0], lon = gps[1], alt = gps[2];
+
+                // 2.4 元数据存 Redis Hash, handleCallback 时用 (taskId, frame.id) 反查
+                //     key: zhimou:img:meta:{taskId}:{imageId}  (回调时 frame.id = image_id 原样返回)
+                String metaKey = "zhimou:img:meta:" + taskId + ":" + imageId;
+                Map<String, String> meta = new LinkedHashMap<>();
+                meta.put("local_image_name", localImageName);
+                meta.put("local_image_path", dayDir + "/" + fileName);
+                meta.put("latitude", lat != null ? lat.toPlainString() : "");
+                meta.put("longitude", lon != null ? lon.toPlainString() : "");
+                meta.put("altitude", alt != null ? alt.toPlainString() : "");
+                stringRedisTemplate.opsForHash().putAll(metaKey, meta);
+                stringRedisTemplate.expire(metaKey, 24, TimeUnit.HOURS);
+
+                // 2.5 上报图片 (image_id 会在回调里原样返回为 data.frame.id)
+                byte[] imageBytes = Files.readAllBytes(srcFile.toPath());
+                JsonNode r = reportImage(taskId, imageId, aircraftSn, imageBytes);
+                if (r != null) {
+                    success++;
+                    log.info("[知眸-图片批量上报] 上报成功 taskId={}, imageId={}, fileName={}, gps=({},{}), alt={}",
+                            taskId, imageId, fileName,
+                            lat != null ? lat.toPlainString() : "N/A",
+                            lon != null ? lon.toPlainString() : "N/A",
+                            alt != null ? alt.toPlainString() : "N/A");
+                } else {
+                    fail++;
+                    log.warn("[知眸-图片批量上报] 上报失败 taskId={}, imageId={}, fileName={}",
+                            taskId, imageId, fileName);
+                }
+            } catch (Exception e) {
+                fail++;
+                log.error("[知眸-图片批量上报] 异常 taskId={}, imageId={}, file={}",
+                        taskId, imageId, srcFile.getName(), e);
+            }
+            imageId++;
+            // 每次上报后等待1秒 (知眸限制: 每任务最小上报间隔1秒)
+            try { Thread.sleep(1000); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+        }
+        log.info("[知眸-图片批量上报] 完成 taskId={}, 总数={}, 成功={}, 失败={}",
+                taskId, imageFiles.size(), success, fail);
+        // 3. 不主动 deleteTask (等回调到达后由外部 Controller 调用 closeZhimouTask)
+        return taskId;
     }
 
     @Override

@@ -508,25 +508,37 @@ public class ZhimouOpenApiClient {
      * 上报图片给图片分析任务 (POST /api/task/{taskId}/image)
      * mode=image 时使用; 视频分析任务不用.
      *
+     * 接口文档: https://openapi.zhimouyun.com/470173793e0
+     * - Path: /api/task/{task_id}/image
+     * - Query: image_id (integer, 可选, 回调里原样返回为 data.frame.id)
+     * - Query: device_id (string, 可选, 会更新任务开启时的device)
+     * - Query: enhance (integer, 默认0, 1=开启图片增强识别)
+     * - Body: application/octet-stream (二进制图片)
+     * - 限制: 每任务最小上报间隔1秒
+     *
      * @param imageId 图片编号(调用方指定, 回调里原样返回, 方便关联)
      * @param device  设备号(飞机SN)
      * @param imageBytes 图片二进制
      */
     public JsonNode reportImage(String taskId, long imageId, String device, byte[] imageBytes) {
         if (StrUtil.isBlank(taskId) || imageBytes == null) return null;
-        String url = buildUrl("/api/task/" + taskId + "/image");
+        // 按 API 文档, query 参数拼接到 URL, Body 为二进制流
+        StringBuilder url = new StringBuilder(buildUrl("/api/task/" + taskId + "/image"));
+        url.append("?image_id=").append(imageId);
+        if (StrUtil.isNotBlank(device)) url.append("&device_id=").append(device);
+        // enhance 默认0, 不传
         try {
-            Map<String, Object> query = new HashMap<>();
-            query.put("id", imageId);
-            if (StrUtil.isNotBlank(device)) query.put("device", device);
             Map<String, String> headers = buildHeaders();
             headers.put("Content-Type", "application/octet-stream");
-            HttpResponse resp = HttpRequest.post(url)
+            String urlStr = url.toString();
+            log.info("[知眸-上报图片] POST url={}, bodySize={}bytes", urlStr, imageBytes.length);
+            HttpResponse resp = HttpRequest.post(urlStr)
                     .addHeaders(headers)
-                    .form(query)
                     .body(imageBytes)
                     .execute();
-            JsonNode root = OBJECT_MAPPER.readTree(resp.body());
+            String respBody = resp.body();
+            log.info("[知眸-上报图片] resp status={}, body={}", resp.getStatus(), respBody);
+            JsonNode root = OBJECT_MAPPER.readTree(respBody);
             int code = root.has("code") ? root.get("code").asInt(-1) : -1;
             if (code != 0) {
                 log.error("[知眸-上报图片] 失败 code={}, msg={}", code, root.path("msg").asText());
