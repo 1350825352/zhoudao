@@ -415,7 +415,6 @@ onUnmounted(() => {
 
   .preview-content {
     position: relative;
-    width: calc(100% - 960px);
     max-width: 90%;
     max-height: 90%;
     display: flex;
@@ -424,9 +423,9 @@ onUnmounted(() => {
 
     .preview-img-container {
       position: relative;
-      width: 100%;
-      max-width: calc(100vw - 960px);
-      max-height: 60vh;
+      display: inline-block;
+      max-width: calc(100vw - 80px);
+      max-height: 70vh;
       overflow: hidden;
       cursor: grab;
       border-radius: 8px;
@@ -438,13 +437,11 @@ onUnmounted(() => {
       }
 
       .preview-img {
-        max-width: 100%;
-        max-height: 60vh;
-        object-fit: contain;
+        display: block;
+        max-width: calc(100vw - 80px);
+        max-height: 70vh;
         transition: transform 0.1s ease-out;
         transform-origin: center center;
-        display: block;
-        margin: 0 auto;
       }
 
       .preview-info-overlay {
@@ -558,29 +555,20 @@ onUnmounted(() => {
   }
 
   @media (max-width: 1400px) {
-    .preview-content {
-      width: calc(100% - 600px);
-    }
     .preview-img-container {
-      max-width: calc(100vw - 600px);
+      max-width: calc(100vw - 80px);
     }
   }
 
   @media (max-width: 1200px) {
-    .preview-content {
-      width: calc(100% - 500px);
-    }
     .preview-img-container {
-      max-width: calc(100vw - 500px);
+      max-width: calc(100vw - 80px);
     }
   }
 
   @media (max-width: 1000px) {
-    .preview-content {
-      width: calc(100% - 300px);
-    }
     .preview-img-container {
-      max-width: calc(100vw - 300px);
+      max-width: calc(100vw - 80px);
     }
   }
 }</style>
