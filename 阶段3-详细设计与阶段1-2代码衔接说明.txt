@@ -1,0 +1,897 @@
+================================================================================
+ 阶段3：MinIO 图片同步处理方案 + 阶段1-2已有代码衔接说明（详细设计 v2.1）
+ 生成时间：2026-08-26
+ 适用范围：二期图片识别阶段3自动触发链路
+ 说明：本设计基于 application-company-a.yml 真实 Token 实测通过，
+       MinIO 路径映射 100% 验证；drone_sn 可从 detail API 实时获取
+       （不再依赖默认SN）。所有阶段3新增代码完全复用阶段1-2的识别、
+       清洗、入库、开关、告警链路。
+================================================================================
+
+目录
+----
+  0. 已验证关键数据结论 (读前必读)
+  1. 阶段1~3 整体链路全景图
+  2. 阶段1、2 已有代码盘点（类、方法、行号、职责）
+  3. 阶段3 新增代码清单（与2的交叉点）
+  4. 逐项衔接细节（按「处理阶段」展开）
+      4.1 触发阶段：开关检查衔接
+      4.2 元数据获取：从路径 -> task_uuid -> drone_sn
+      4.3 图片落盘与 local_image_name 命名规则衔接
+      4.4 知眸侧（createImageTask / 批量上报 / 回调）衔接
+      4.5 自有模型侧（detectAndSave / 入库）衔接
+      4.6 数据清洗：阶段2手动 -> 阶段3自动触发
+      4.7 批次状态（Redis）与图片状态（Redis）的衔接点
+      4.8 临时目录、清理、失败重试的衔接
+      4.9 前端展示 / 告警链路：无需改动的原因
+  5. 修改影响矩阵（哪些文件新增 / 修改 / 零改动）
+  6. 附录：关键方法签名与参数对应表
+================================================================================
+
+
+0. 已验证关键数据结论（读前必读）
+================================================================================
+
+MinIO 完整 ObjectKey 样例：
+  flydata/fh_sync/8566c7de-05ac-41ee-b260-1614848ed037
+                  /826ccf49-8430-4037-a505-cd43b868d4d6
+                  /media
+                  /dbc84414-a612-4637-9964-ea4e8c3ca2a6
+                  /DJI_20260826130711_0001_V.jpeg
+
+实测对应关系：
+  fh_sync/<ORG_UUID>/<PROJECT_UUID>/media/<TASK_UUID>/<filename>
+
+  UUID1 (ORG)     = 8566c7de...  -> 配置 default-organization-uuid ✅
+  UUID2 (PROJECT) = 826ccf49...  -> 配置 default-project-uuid      ✅
+  TASK_UUID       = dbc84414...  -> /openapi/v2.0/flight-task/{TASK_UUID} 返回成功 ✅
+  filename        = DJI_20260826130711_0001_V.jpeg -> media API 15 个 name 前缀一致 ✅
+
+获取飞机 SN 的真实方式（已实测）：
+  GET /openapi/v2.0/flight-task/detail
+      ?workspace_id = 826ccf49... (PROJECT_UUID)
+      &task_uuid    = dbc84414... (TASK_UUID)
+
+  返回 flight_pieces[0].drone_sn          = 1581F8HHX25CL00A06BL ✅
+       flight_pieces[0].drone_info.*      = 设备名/型号/SN ✅
+       flight_pieces[0].task_name         = 任务名 ✅
+       flight_pieces[0].take_off_airport_sn = 机场SN ✅
+       flight_pieces[0].status            = success ✅
+
+完整性校验（已实测）：
+  GET /openapi/v2.0/flight-task/{TASK_UUID}
+    返回 folder_info.expected_file_count = 15
+          folder_info.uploaded_file_count = 15   ← 两者相等才说明公网->内网同步完毕 ✅
+  GET /openapi/v2.0/flight-task/{TASK_UUID}/media
+    返回 size=15，文件名全部为 DJI_*_V.*，与 MinIO ObjectKey 末尾段文件名前缀 100% 匹配 ✅
+
+================================================================================
+
+
+1. 阶段1~3 整体链路全景图
+================================================================================
+
+  阶段1/2 手动入口                  阶段3 MinIO 自动入口（新增）
+  -----------------------------      ----------------------------------------
+  [前端按钮]                         [Spring @Scheduled 每30秒]
+       |                                     |
+       ▼                                     ▼
+  POST /test/image-recognition/run      MinioPollingService.scanAndProcess()
+       |                                     |
+       |  (a) 开关检查                        |  (a) 开关检查         [完全复用]
+       |  TaskSwitchService                   |  TaskSwitchService
+       |  .isImageTaskEnabled()               |  .isImageTaskEnabled()
+       |                                     |
+       |  (b) 扫描本地目录                    |  (b) 解析 MinIO 路径正则
+       |                                     |  (c) 调 detail/media API 拿 SN + 校验完整性 [新增]
+       |                                     |       (DjiOpenApiClient 新增3个方法)
+       |                                     |
+       |  (c) 图片 File[] 列表                |  (d) MinIO getObject -> 本地 temp File[]  [新增]
+       |                                     |
+       ▼                                     ▼
+  +----------------------------------- 并行触发（同一份 Service 逻辑）-----------------------------------+
+  |                                                                                                       |
+  |   线程A：知眸图片任务 (复用心智GPU)                                                                    |
+  |     ZhimouTaskService.createAndReportImageBatch(List<File>, aircraftSn, appId, pkgId, imageBaseDir)    |
+  |       L createImageTask(aircraftSn, appId, pkgId)                                                     |
+  |       L 循环：                                                                                         |
+  |           - 落盘 imageBaseDir/yyyyMMdd/xxx.jpeg  (阶段1/2 与 阶段3 同一目录)                           |
+  |           - local_image_name = 【文件名去扩展名 / 或 TASK_UUID/文件名去扩展名】                        |
+  |           - EXIF GPS 提取                                                                              |
+  |           - Redis zhimou:img:meta:{taskId}:{imageId} <- local_image_name + GPS                        |
+  |           - 调 reportImage(image_id, device_id=aircraftSn, 二进制)                                    |
+  |       L 返回知眸 taskId                                                                                |
+  |                                                                                                       |
+  |   线程B：自有模型识别 (复用CPU)                                                                        |
+  |     循环每张图：                                                                                       |
+  |       SelfModelDetectService.detectAndSave(File, threshold, imageBaseDir)                              |
+  |         L 落盘 imageBaseDir/yyyyMMdd/xxx.jpeg  (与知眸同一目录)                                        |
+  |         L local_image_name 【同规则】                                                                  |
+  |         L EXIF GPS + 宽高                                                                              |
+  |         L POST 192.168.2.200:5173/api/v1/detect (multipart)                                           |
+  |         L 入库 self_model_image_detection (clean_status=0)                                             |
+  |         L 【阶段3新增】入库后 HSET minio:flight:img:{name} self=1 + 检查是否到齐                      |
+  |                                                                                                       |
+  +----------------------------------- 并行触发结束 -------------------------------------------------------+
+       |                                     |
+       ▼                                     ▼
+  知眸异步回调到达 POST /api/zhimou/callback
+       |
+       ▼
+  ZhimouTaskService.handleCallback(root)  ← （阶段2已有）
+       |
+       +--> 从 Redis zhimou:img:meta:{taskId}:{frameId} 反查 local_image_name
+       |
+       +--> 入库 zhimou_image_detection (clean_status=0)
+       |
+       +--> 【阶段3新增】入库后 HSET minio:flight:img:{name} zhimou=1 + 检查是否到齐
+       |
+       |   (若两者都到齐)
+       ▼
+  ImageCleanupService.cleanupSingleImage(local_image_name)  ←（阶段2已有，零改动复用）
+       |
+       +--> 查两表 → 匹配 bbox 中心点距离
+       +--> 写入 clean_status (1正常, 2误识别) + clean_remark
+       |
+       ▼
+  screen-v3 /alerts 接口 (ApiController)
+       |
+       +--> alert_data_source == 'image' → 查 zhimou_image_detection clean_status != 0
+       +--> alert_data_source == 'video' → 查 zhimou_detection_result     ← 阶段2已有开关，零改动
+
+
+================================================================================
+
+
+2. 阶段1、2 已有代码盘点（类 / 方法 / 位置 / 职责）
+================================================================================
+
+(2.1) 开关服务
+  文件：src/main/java/com/dji/sikong/service/TaskSwitchService.java
+  关键方法：
+    - isImageTaskEnabled()           L102-L105    图片识别任务是否开启（0/1）
+    - isVideoTaskEnabled()           L97-L100     视频任务开关
+    - getAlertDataSource()           L107-L111    告警数据源 (video/image)
+    - getValue(key)                  L56-L71      Redis 优先 + DB 兜底
+  阶段3衔接：MinioPollingService 在扫描开始后，第一步就调用 isImageTaskEnabled()，
+            关闭则整轮跳过，零新增逻辑。
+
+(2.2) 知眸任务服务（图片+视频）
+  文件：src/main/java/com/dji/sikong/service/impl/ZhimouTaskServiceImpl.java
+  关键方法（与图片相关部分，阶段2已实现）：
+    - createImageTask(aircraftSn, appId, applicationPackageId)
+                                             L2041-L2075
+         调知眸 createTask (mode=image, app_ids, zapk_id, device_id, report_url)
+         入库 zhimou_task 表 (mode=image, aircraftSn, appId, pkgId, status=1)
+    - reportImage(taskId, imageId, aircraftSn, byte[])
+                                             L2077-L2080
+         调知眸 reportImage（query 传 image_id + device_id，body 传二进制）
+    - createAndReportImageBatch(List<File>, aircraftSn, appId, pkgId, imageBaseDir)
+                                             L2085-L2169   ← 阶段3核心复用点
+         1. createImageTask 拿 taskId
+         2. for 每张 File:
+              - 落盘 imageBaseDir/yyyyMMdd/原文件名
+              - local_image_name = 文件名去扩展名  ←【阶段3要改的地方】
+              - EXIF GPS 提取 (ImageExifUtil)
+              - Redis HSETALL zhimou:img:meta:{taskId}:{imageId}
+                           { local_image_name, local_image_path, latitude, longitude, altitude }
+                           EXPIRE 24h
+              - reportImage(taskId, imageId++, aircraftSn, 图片二进制)
+              - Thread.sleep(1000ms) (知眸 1s 最小间隔)
+         3. 返回 taskId
+    - handleCallback(JsonNode root)       L1080-L1524
+         判断 data.frame 是否存在 → 分支到内部 handleImageCallback
+         handleImageCallback（私有方法，阶段2已写好）：
+           1. 解析 frame.id / image_id → frameId
+           2. Redis key = zhimou:img:meta:{taskId}:{frameId} → 反查 local_image_name / GPS
+           3. 解析回调 apps[] → targetsJson / hit_count
+           4. 入库 zhimou_image_detection (clean_status=0)   ←【阶段3在此处后加3行】
+           5. // 6. TODO 二期任务9: 触发数据清洗  (L1522, 阶段2留的 TODO，阶段3要实现)
+  阶段3衔接：
+     (a) createAndReportImageBatch 目前把「文件名去扩展名」当 local_image_name，阶段3必须
+         注入前缀 TASK_UUID/，否则不同架次同名 0001_V.jpeg 会冲突。需要增加一个重载方法，
+         或把 local_imageName 构造逻辑抽取出来允许调用方传入。
+     (b) handleImageCallback 末尾 L1522 的 TODO 需要补齐：入库后立刻检查图片级 Redis 状态，
+         如果 self=1 则立即调 cleanupSingleImage。否则仅把 zhimou=1 写入。
+
+(2.3) 自有模型识别服务
+  文件：src/main/java/com/dji/sikong/service/SelfModelDetectService.java
+  关键方法：
+    - detectAndSave(File imageFile, BigDecimal threshold, String imageBaseDir)
+                                           L54-L167    ← 阶段3核心复用点
+         1. local_image_name = 文件名去扩展名  ←【阶段3要改的地方，同知眸】
+         2. 落盘 imageBaseDir/yyyyMMdd/原文件名（同知眸）
+         3. EXIF GPS + 宽高 (ImageExifUtil)
+         4. POST http://192.168.2.200:5173/api/v1/detect (multipart image + threshold, timeout 5s)
+         5. 解析响应 data.detections → targets_json, hit_count, model_version
+         6. 入库 self_model_image_detection (call_status, clean_status=0)   ←【阶段3后加3行】
+  阶段3衔接：
+     (a) 同知眸：local_image_name 必须能被外部传入「TASK_UUID/」前缀，建议在方法入参
+         增加一个可选参数 customLocalImageName（空则沿用旧逻辑，确保阶段1手动入口仍可用）。
+     (b) 入库成功后 (L162 之后)，追加写入 Redis 图片级状态：minio:flight:img:{name} self=1，
+         并立即读 hash，若 zhimou=1 → 调 cleanupSingleImage(name)。
+         注意：阶段1手动入口无 zhimou 写这个 hash，故不会触发；只有阶段3入口才会同时存在
+         zhimou 和 self 两个字段，天然隔离不互相干扰。
+
+(2.4) 数据清洗服务
+  文件：src/main/java/com/dji/sikong/service/ImageCleanupService.java
+  关键方法：
+    - cleanupSingleImage(String localImageName)              L51-L53   [重载入口]
+    - cleanupSingleImage(String localImageName, double threshold)   L55-L146
+         1. 查 zhimou_image_detection WHERE local_image_name=? 且 deleted=0
+         2. 查 self_model_image_detection WHERE local_image_name=? 且 deleted=0
+         3. 任一无结果 → clean_status=1 正常
+         4. 提取两表 targets_json，算每个目标中心点像素坐标
+         5. 知眸每个目标 ↔ 自有最近目标距离 < 50px → 算匹配
+         6. 知眸所有目标都匹配 → 误识别 clean_status=2；否则正常 clean_status=1
+         7. 更新两表 clean_status / clean_time / clean_remark
+    - cleanupAllPending()                                L151-L183   阶段2手动入口仍可用
+  阶段3衔接：**零改动复用**。ImageCleanupService 纯粹根据 local_image_name
+            查两表然后更新 clean_status，完全不关心是手动入口还是 MinIO 触发，
+            只要上游保证传入正确的 local_image_name 即可。
+
+(2.5) 测试入口控制器（阶段1-2的手动链路）
+  文件：src/main/java/com/dji/sikong/controller/ImageRecognitionTestController.java
+  关键方法：
+    - run(@RequestBody Map params)            L67-L209
+         入口点：把 扫描图片 → 并行两条线程 → 汇总返回
+         关键参数：imageDir, imageBaseDir, aircraftSn, appId, applicationPackageId, threshold,
+                   runZhimou, runSelfModel
+         开关检查：L82-L85 调 taskSwitchService.isImageTaskEnabled()
+         并行方式：
+            zhimouThread = new Thread( createAndReportImageBatch(Arrays.asList(imageFiles),
+                                                                 aircraftSn, appId, pkgId, imageBaseDir) )
+            selfModelThread = new Thread( for(File f : imageFiles)
+                                               detectAndSave(f, threshold, imageBaseDir)
+                                               Thread.sleep(500) )
+            zhimouThread.join(); selfModelThread.join();  // 仅等上报结束
+    - cleanupOne(localImageName, threshold)     L215-L225   POST /cleanup
+    - cleanupAll()                              L231-L235   POST /cleanup-all
+    - closeTask(taskId)                         L242-L248   POST /close
+  阶段3衔接：不要修改这个控制器（阶段2已稳定）。把「并行触发」这段逻辑抽成一个新的
+            Service 方法，例如 ImageRecognitionFacade.processImageBatch(List<File>,
+            aircraftSn, appId, pkgId, threshold, imageBaseDir, customLocalImagePrefix)，
+            ImageRecognitionTestController.run() 和 MinioPollingService 都去调用它。
+            这样两处入口行为完全一致，避免复制粘贴出错。
+
+(2.6) 知眸回调入口控制器
+  文件：src/main/java/com/dji/sikong/controller/ZhimouController.java
+  关键方法：
+    - callback(HttpServletRequest request)    L522     POST /api/zhimou/callback
+         读取 body -> parse Json -> zhimouTaskService.handleCallback(root)
+  阶段3衔接：**零改动**。回调 URL（zhimouProperties.openapi.callbackUrl）阶段3沿用，
+            阶段3写入的 Redis 元数据 local_image_name 虽然前缀变了 (TASK_UUID/file_name)，
+            但回调处理代码只把它当字符串反查，不做任何拼接假设，所以天然兼容。
+
+(2.7) 告警数据接口（前端）
+  文件：src/main/java/com/dji/sikong/controller/ApiController.java
+  关键逻辑（阶段2已实现）：
+    - alert_data_source = image → 查 zhimou_image_detection WHERE clean_status != 0
+                               → 只返回 1=正常 或 2=误识别，未清洗(0)不展示
+    - alert_data_source = video → 查 zhimou_detection_result 旧表
+  阶段3衔接：**零改动**。阶段3生成的 zhimou_image_detection 记录与阶段2手动生成
+            的记录完全同构（表结构一致、clean_status 语义一致），前端切换 image 数据源
+            后自然就能看到阶段3自动触发 + 自动清洗完成的告警。
+
+(2.8) 司空2 OpenAPI 客户端
+  文件：src/main/java/com/dji/sikong/openapi/DjiOpenApiClient.java
+  现有与飞行任务相关的方法（阶段1/2已有）：
+    - listFlightTasks(projectUuid)                         L143-L148
+         GET /openapi/v2.0/flight-task/list  仅带 pageNum,pageSize
+    - getFlightTaskDetail(projectUuid, taskUuid)            L151-L155
+         GET /openapi/v2.0/flight-task/{taskUuid}?workspace_id=projectUuid
+         （返回通用 task 信息，不含 flight_pieces！）
+    - getRecentFlightTasks(projectUuid, sn)                 L158-L163
+         GET /openapi/v2.0/workspaces/{...}/flight-tasks/recent?sn[]=..
+  阶段3衔接：**需新增 3 个方法**（复用 get() 模板，约 40 行）：
+    (a) getFlightTaskTrackDetail(workspaceId, taskUuid)
+        → GET /openapi/v2.0/flight-task/detail
+          ?workspace_id=workspaceId
+          &task_uuid=taskUuid
+        返回 flight_pieces[].drone_sn / task_name / take_off_airport_sn
+        说明：注意参数名不能改，实测必须 workspace_id（文档要求），workspaceId 传
+              properties.getDefaultProjectUuid()。
+    (b) getFlightTaskInfo(taskUuid)
+        → GET /openapi/v2.0/flight-task/{taskUuid}
+          ?workspace_id={defaultProjectUuid}
+        返回 folder_info.expected_file_count / uploaded_file_count
+    (c) getFlightTaskMedia(taskUuid)
+        → GET /openapi/v2.0/flight-task/{taskUuid}/media
+        返回 list.name[], 用于与 MinIO 实际文件名二次校验。
+
+(2.9) 配置类
+  文件：src/main/java/com/dji/sikong/config/ZhimouProperties.java
+  已有 getter（阶段3直接用）：
+    - openapi.getDefaultAppId() / getDefaultPkgId()     L80, L92
+        → 阶段3默认用配置文件的 appId 和 pkgId，不需要 MinioPollingService 再传参
+    - image.getSaveRootDir() / getUrlPrefix()            L96-L110
+        → 知眸和自有模型落盘的 imageBaseDir = saveRootDir
+  文件：src/main/java/com/dji/sikong/config/DjiOpenApiProperties.java
+  已有 getter（阶段3直接用）：
+    - getDefaultProjectUuid(), getDefaultOrganizationUuid(), getUserToken(), getBaseUrl()
+  阶段3衔接：零改动。只需在 ZhimouOpenApiProperties / DjiOpenApiProperties 旁新增
+            MinioProperties（另建新配置类）即可。
+
+
+================================================================================
+
+
+3. 阶段3 新增代码清单（与 2 的交叉点）
+================================================================================
+
+(3.1) 新增文件
+
+  A. config/MinioProperties.java
+     @ConfigurationProperties(prefix = "minio")
+     字段：
+       endpoint, accessKey, secretKey, bucket,
+       scanPrefix (默认 "fh_sync/"),
+       pollIntervalMs (默认 30000),
+       tempDir (可空, 默认 zhimou.image.saveRootDir + "/minio-incoming"),
+       cleanupTempAfter (默认 true),
+       validateUploadCountBeforeProcess (默认 true)
+     依赖：零。
+
+  B. config/MinioConfig.java
+     @Bean public MinioClient minioClient(MinioProperties p)
+     健康检查：MinIO.bucketExists(bucket) 失败则 ERROR 日志。
+
+  C. service/MinioPollingService.java          ← 【阶段3核心文件】
+     @Slf4j @Service
+     依赖注入：
+       StringRedisTemplate                  用于批次 / 图片级状态
+       MinioClient + MinioProperties        扫描 & 下载
+       DjiOpenApiClient + DjiOpenApiProperties  拿 drone_sn & 完整性校验
+       TaskSwitchService                    isImageTaskEnabled()
+       ZhimouProperties                     appId/pkgId/imageBaseDir
+       ImageRecognitionFacade（新抽）       processImageBatch()
+       ImageCleanupService                  cleanupAllPending（兜底用）
+     方法：
+       - @Scheduled(fixedDelayString = "${minio.poll-interval-ms:30000}")
+         scanAndProcess()
+       - parseTaskUuidsFromMinIO() : List<TaskGroup>
+         内部正则 ^fh_sync/(ORG_UUID)/(PROJECT_UUID)/media/([^/]+)/ 分组
+       - boolean tryAcquireBatchLock(taskUuid) : SET minio:flight:{tuuid} PROCESSING
+         带 TTL 30min，NX (只在不存在时设置)
+       - void releaseBatchLock(taskUuid)    : 删除 PROCESSING 锁（仍在同步时用）
+       - void markBatchComplete(taskUuid)   : SET minio:flight:{tuuid} COMPLETED 永久
+       - void downloadBatch(taskUuid, localDir) : List<File>
+         MinIO listObjects(prefix = fh_sync/..{PROJECT_UUID}/media/{taskUuid}/)
+         只收 jpg/jpeg/png，getObject -> save(tempDir/{taskUuid}/filename)
+       - void processSingleBatch(taskUuid, List<File> images, String droneSn)
+         调用 ImageRecognitionFacade.processImageBatch(..., customLocalImagePrefix=taskUuid)
+       - void cleanupTempFiles(taskUuid)     : 递归删除 tempDir/{taskUuid}
+       - void sweepStaleBatches()            : （可选，每分钟）PROCESSING 超过2小时告警
+       - retryBatch(taskUuid)                : （配合可选 MinioController.retry）
+         DEL minio:flight:{taskUuid} 然后重新入队 processSingleBatch
+
+  D. service/ImageRecognitionFacade.java   ← 【抽自 ImageRecognitionTestController】
+     @Service
+     依赖注入：ZhimouTaskService, SelfModelDetectService, TaskSwitchService
+     方法：
+       - BatchProcessResult processImageBatch(
+             List<File> imageFiles,
+             String aircraftSn,               // 阶段3从 detail API拿；阶段2从请求传入
+             String appId,
+             String applicationPackageId,
+             BigDecimal threshold,
+             String imageBaseDir,
+             String customLocalImagePrefix,   // 阶段2=null沿用旧名去扩展名; 阶段3=taskUuid
+             boolean runZhimou,
+             boolean runSelfModel,
+             long zhimouReportIntervalMs,     // 阶段2固定1000, 阶段3仍1000
+             long selfModelIntervalMs         // 阶段2固定500,  阶段3仍500
+         )
+       内部结构：完全对应当前 ImageRecognitionTestController.run() 的两个 Thread + join。
+       关键点：customLocalImagePrefix 不为空时，在
+                 createAndReportImageBatch 与 detectAndSave 的调用之前，
+                 给每个 File 包装/改名，或者直接调用新的重载方法（见 4.4/4.5）。
+       返回值：zhimouTaskId, zhimouErrorMsg, selfModelSuccessCount, selfModelFailCount。
+
+  E. controller/MinioController.java        ← 【可选，推荐做】
+     提供运维接口：
+       - POST /api/minio/retry/{taskUuid}
+           手动重跑某批次（会清掉 Redis minio:flight:{tuuid} + 调 service.retryBatch）
+       - GET  /api/minio/batches?state=PROCESSING|COMPLETED|PENDING
+           扫 Redis 展示当前状态
+       - POST /api/minio/notify              （未来启用 Webhook 时预留）
+           只在 body.Records[0].s3.object.key 解析到路径后调用 MinioPollingService
+             .processSingleBatch，和轮询进入点完全相同。
+
+  F. 配置段 application.yml / application-company-a.yml
+     在文件末尾追加：
+       minio:
+         endpoint: http://192.168.2.200:9000
+         access-key: admin
+         secret-key: Admin@123456
+         bucket: flydata
+         scan-prefix: fh_sync/
+         poll-interval-ms: 30000
+         temp-dir: H:/traeproject/zhoudao/zhimou-minio-temp
+         cleanup-temp-after: true
+         validate-upload-count-before-process: true
+     注意：同时需要同步 deploy-package/application-company-a.yml（生产部署用），
+           但先改 src/main/resources/application-*.yml（规则项目要求）。
+
+(3.2) 阶段2文件的最小修改点（见4节）
+  - ZhimouTaskServiceImpl
+      新增 createAndReportImageBatch(.., customLocalImagePrefix) 重载或抽取 local_image_name 构造
+      handleImageCallback 入库后追加 3 行 Redis + 触发清洗
+  - SelfModelDetectService
+      新增 detectAndSave(.., customLocalImageName) 重载或入参扩展
+      入库后追加 3 行 Redis + 触发清洗
+  - DjiOpenApiClient
+      新增 3 个方法（见 2.8）
+  - 可选：ImageRecognitionTestController.run() 改为调用新 Facade 方法
+    （不强制，但推荐，消除重复代码）
+
+
+================================================================================
+
+
+4. 逐项衔接细节（按处理阶段展开）
+================================================================================
+
+----------------------------------------------------------------------
+4.1 触发阶段：开关检查衔接
+----------------------------------------------------------------------
+
+  阶段2已有实现 (ImageRecognitionTestController L82-L85):
+    if (!taskSwitchService.isImageTaskEnabled()) {
+        return R.fail("图片识别任务已关闭...");
+    }
+
+  阶段3衔接（MinioPollingService.scanAndProcess() 开头）：
+    if (!taskSwitchService.isImageTaskEnabled()) {
+        log.debug("[MinIO轮询] image_task 关闭，本轮跳过");
+        return; // 本轮直接结束，不做任何 MinIO 扫描与 API 调用
+    }
+  + 说明：Admin 管理页面切换 image_task=0 时，两个入口会同时被禁止；
+         Redis 缓存 TTL 7天，修改后立即生效，一致性已有保障。
+  + 开关联动：video_task / alert_data_source 完全不影响阶段3；
+         alert_data_source=image 时 screen-v3 才展示图片识别结果，
+         这是查询侧逻辑，写入侧不依赖。
+
+----------------------------------------------------------------------
+4.2 元数据获取：路径解析 -> task_uuid -> drone_sn
+----------------------------------------------------------------------
+
+  阶段3新增逻辑（MinioPollingService.parseTaskUuidsFromMinIO）：
+    (a) MinIO.listObjects(bucket, prefix=fh_sync/, recursive=true)
+    (b) 对每个 ObjectKey 用正则提取：
+          regex = "^fh_sync/"+orgUuid+"/"+projectUuid+"/media/([^/]+)/(.+\\.(?:jpe?g|png))$"
+          group(1) = taskUuid
+          group(2) = filename
+        若 orgUuid / projectUuid 与当前配置不匹配 → WARN 后跳过（多组织/项目隔离）
+    (c) 按 taskUuid 分组收集 filename 列表 → List<TaskGroup>
+        TaskGroup = { taskUuid, List<String> filenames, createTime(最大文件更新时间) }
+
+  对每个 TaskGroup（批次未处理）：
+    (a) 先 acquireBatchLock(taskUuid) = SETNX minio:flight:{taskUuid}=PROCESSING TTL30min
+        失败 → 跳过
+    (b) 调 DjiOpenApiClient.getFlightTaskInfo(taskUuid)
+          folder_info.uploaded < expected → releaseBatchLock，return（下一轮再试）
+    (c) 调 DjiOpenApiClient.getFlightTaskMedia(taskUuid).size() !=
+        MinIO 当前该 taskUuid 下实际图片数 → releaseBatchLock，return（双保险）
+    (d) ⭐ 调 DjiOpenApiClient.getFlightTaskTrackDetail(defaultProjectUuid, taskUuid)
+          flight_pieces[0].drone_sn → droneSn
+          若为空 → fallback:
+              ZhimouProperties (没有默认SN字段，这里建议新增
+                application-company-a.yml 中 zhimou.openapi.default-aircraft-sn)
+              若仍没有 → WARN 日志后跳过当前批次，不执行空SN上报，避免知眸任务异常。
+          （可选：把 drone_info.device_name, task_name, take_off_airport_sn
+                存到 Redis hash minio:flight:{taskUuid} 中，便于运维页面展示。）
+
+  已复用到的阶段2代码：
+    - DjiOpenApiClient.get/post 模板（新增 3 个 getFlightTask* 方法套壳）
+    - DjiOpenApiProperties.getDefaultProjectUuid() / getDefaultOrganizationUuid()
+
+----------------------------------------------------------------------
+4.3 图片落盘与 local_image_name 命名规则衔接
+----------------------------------------------------------------------
+
+  阶段2已有实现（两处相同的规则）：
+    知眸 (ZhimouTaskServiceImpl L2120-L2124):
+      String fileName = srcFile.getName();
+      int dotIdx = fileName.lastIndexOf('.');
+      String local_image_name = dotIdx > 0 ? fileName.substring(0, dotIdx) : fileName;
+    自有模型 (SelfModelDetectService L63-L67):
+      String fileName = imageFile.getName();
+      int dotIdx = fileName.lastIndexOf('.');
+      String localImageName = dotIdx > 0 ? fileName.substring(0, dotIdx) : fileName;
+
+  问题：
+    如果架次1 有 DJI_..._0001_V.jpeg，架次2 也会有 DJI_..._0001_V.jpeg（这是 DJI 司空命名规则），
+    那么两者 local_image_name 完全相同，清洗时会错误地把两个不同架次的识别结果配成同一张图。
+
+  阶段3衔接修改（必须做）：
+    方案A（推荐，低侵入）：为两个方法新增重载或入参 customLocalImagePrefix。
+      (a) ZhimouTaskServiceImpl.createAndReportImageBatch
+          新增重载：
+            createAndReportImageBatch(List<File>, aircraftSn, appId, pkgId, imageBaseDir,
+                                      String customLocalImagePrefix)
+          重载内部把 customLocalImagePrefix 传入 for 循环，原 L2123 一行改为：
+            String baseName = dotIdx>0 ? fileName.substring(0,dotIdx) : fileName;
+            String localImageName = StrUtil.isNotBlank(customLocalImagePrefix)
+                  ? customLocalImagePrefix + "/" + baseName
+                  : baseName;
+          （同时 local_image_path 也保持原样即可，路径不参与清洗关联键）
+          老方法 createAndReportImageBatch(5 参数) 直接调用重载, prefix=null,
+          确保阶段2手动入口零行为变化。
+      (b) SelfModelDetectService.detectAndSave
+          入参新增 String customLocalImageName（可 @Nullable），或再写重载：
+            detectAndSave(File, BigDecimal, String imageBaseDir, @Nullable String customLocalImageName)
+          方法内部 L65-67 改为：
+            String baseName = dotIdx>0 ? fileName.substring(0,dotIdx) : fileName;
+            String localImageName = StrUtil.isNotBlank(customLocalImageName)
+                  ? customLocalImageName : baseName;
+          老方法仍兼容。
+    阶段3调用时传：
+      customLocalImagePrefix = TASK_UUID            （知眸批量）
+      customLocalImageName   = TASK_UUID + "/" + baseName   （自有模型单张）
+    最终 local_image_name 例：
+      dbc84414-a612-4637-9964-ea4e8c3ca2a6/DJI_20260826130711_0001_V
+    全局唯一，不再有跨架次冲突。
+
+  与阶段2手动入口的兼容：
+    手动入口不传 customLocalImage*，走旧分支（仍用文件去扩展名），
+    表中同一项目下会同时存在"前缀形式"和"无前缀形式"的 local_image_name，
+    两者互相不干扰（清洗按 local_image_name 精确相等匹配）。
+    （如果希望统一，可后续把手动入口也改为传一个批次前缀，但不是阶段3必须。）
+
+  ImageCleanupService 零改动：
+    因为它只把 local_image_name 当作等值查询键，内部不做任何关于 '/' 的假设。
+
+----------------------------------------------------------------------
+4.4 知眸侧（创建任务 / 批量上报 / 回调）衔接
+----------------------------------------------------------------------
+
+  阶段3 -> ZhimouTaskServiceImpl 调用链：
+    MinioPollingService.processSingleBatch
+      -> ImageRecognitionFacade.processImageBatch(
+            customLocalImagePrefix=taskUuid,
+            aircraftSn=droneSn,                  ← 已从 detail API 实时取真实值
+            appId=zhimouProperties.openapi.defaultAppId,
+            applicationPackageId=zhimouProperties.openapi.defaultPkgId,
+            threshold=0.5,
+            imageBaseDir=zhimouProperties.image.saveRootDir,   ← 阶段2共用同一目录
+            ...)
+        -> zhimouTaskService.createAndReportImageBatch(..prefix..)
+            1. createImageTask(aircraftSn, appId, pkgId)
+               - 内部 body.put("device_id", aircraftSn);   L2053   ✅ 阶段3传的是真实SN
+               - report_url = properties.openapi.callbackUrl   L2055 ✅ 仍回调到我们
+               - 入库 zhimou_task mode=image
+            2. for imageId=1..N
+               - 落盘 imageBaseDir/yyyyMMdd/filename
+                 阶段3下载的是 temp-dir/{taskUuid}/filename，落盘后与阶段2
+                 一样 copy 到 saveRootDir/yyyyMMdd/，两套目录并存
+                 （temp-dir 处理完成后可整体删除，saveRootDir 保留作为长期静态访问）
+               - local_image_name = taskUuid + "/" + baseName
+               - EXIF GPS ImageExifUtil.extractGps(srcFile)   ← 与阶段2完全同工具
+               - Redis HSETALL zhimou:img:meta:{taskId}:{imageId}
+                   local_image_name = taskUuid/baseName  ✅ 写入的是带前缀版本
+               - reportImage(taskId, imageId, aircraftSn, imageBytes)
+                   query 参数 image_id=&device_id= 格式完全复用 L2077
+               - Thread.sleep(1000)    ← 保持知眸最小间隔约束
+
+  知眸回调到达（阶段2 handleImageCallback 完全不用改路径拼接，因为它只是读 Redis 反查回来的值）：
+    L1449-L1460 meta.get("local_image_name") → 现在返回的是 "taskUuid/baseName"
+    L1497 rec.setLocalImageName(localImageName) → 入库也用该值 ✅ 与自有模型侧保持一致
+
+  【阶段3必须追加到 handleImageCallback 末尾】（ZhimoTaskServiceImpl L1522 附近）：
+    原最后三行是 LOG + TODO 注释 + return null。在 return 之前插入：
+
+        // ===== 阶段3追加：图片级状态 + 自动触发清洗 =====
+        if (StrUtil.isNotBlank(localImageName)) {
+            String imgKey = "minio:flight:img:" + localImageName;
+            stringRedisTemplate.opsForHash().put(imgKey, "zhimou", "1");
+            stringRedisTemplate.expire(imgKey, 7, TimeUnit.DAYS);
+            // 如果自有模型结果先到了(self=1已存在) → 立刻清洗
+            Map<Object, Object> imgStatus = stringRedisTemplate.opsForHash().entries(imgKey);
+            if (imgStatus.containsKey("zhimou") && imgStatus.containsKey("self")) {
+                try {
+                    imageCleanupService.cleanupSingleImage(localImageName);
+                    stringRedisTemplate.delete(imgKey);
+                    // 最后一张？批次整体标记 COMPLETED + 删临时文件（扫描 Redis keys 匹配 taskUuid 前缀）
+                    tryMarkBatchCompleteByTaskUuid(localImageName.substring(0,
+                        localImageName.indexOf('/')));
+                } catch (Exception e) {
+                    log.error("[知眸-回调] 自动清洗异常 localImageName={}", localImageName, e);
+                }
+            }
+        }
+        // ===== 阶段3追加结束 =====
+
+    说明：
+      - 需要在 ZhimouTaskServiceImpl 新增 @Resource ImageCleanupService 注入
+      - 新增私有方法 tryMarkBatchCompleteByTaskUuid(String prefix):
+          扫 Redis keys "minio:flight:img:" + prefix + "*"，若都没有则
+            SET minio:flight:{prefix}=COMPLETED 永久
+            删除临时目录 minioTempDir.resolve(prefix)
+      - 这段插入对阶段2手动入口"无害"：手动入口时 zhimou 会写 zhimou=1，
+        但 self 侧没有写入 minio:flight:img:{name} (阶段2 SelfModelDetectService 不写)，
+        所以 if(zhimou && self) 不成立，不会触发清洗。阶段2手动入口仍需要
+        POST /test/image-recognition/cleanup 手动触发，行为与设计一致。
+
+----------------------------------------------------------------------
+4.5 自有模型侧（detectAndSave / 入库）衔接
+----------------------------------------------------------------------
+
+  阶段3调用链：
+    Facade 循环每张图片：
+      SelfModelDetectService.detectAndSave(
+          file, threshold, imageBaseDir,
+          customLocalImageName = taskUuid + "/" + baseNameWithoutExt   ← 带前缀
+      )
+
+  detectAndSave 现有流程 (L54-L167)：
+    1. 落盘 imageBaseDir/yyyyMMdd/filename
+    2. local_image_name = 去扩展名  → 改为 customLocalImageName
+    3. EXIF GPS
+    4. POST 192.168.2.200:5173/api/v1/detect  ← 地址/超时/阈值 与阶段2一致
+    5. 解析 code, data.detections → targetsJson, hitCount, modelVersion, ...
+    6. 入库 self_model_image_detection mapper.insert(rec)   ← 同一表，clean_status=0
+
+  【阶段3必须追加到入库 (L162) 之后】（SelfModelDetectService L162-L167）：
+
+        // ===== 阶段3追加：图片级状态 + 自动触发清洗 =====
+        if (StrUtil.isNotBlank(rec.getLocalImageName())) {
+            String imgKey = "minio:flight:img:" + rec.getLocalImageName();
+            // 写 Redis 自有机状态
+            stringRedisTemplate.opsForHash().put(imgKey, "self", "1");
+            stringRedisTemplate.expire(imgKey, 7, TimeUnit.DAYS);
+            // 如果知眸先回调到达 (zhimou=1 已存在) → 立刻清洗
+            Map<Object, Object> imgStatus = stringRedisTemplate.opsForHash().entries(imgKey);
+            if (imgStatus.containsKey("zhimou") && imgStatus.containsKey("self")) {
+                try {
+                    imageCleanupService.cleanupSingleImage(rec.getLocalImageName());
+                    stringRedisTemplate.delete(imgKey);
+                    // 尝试标记批次完成
+                    tryMarkBatchCompleteByTaskUuid(extractTaskUuidPrefix(rec.getLocalImageName()));
+                } catch (Exception e) {
+                    log.error("[自有模型] 自动清洗异常 localImageName={}", rec.getLocalImageName(), e);
+                }
+            }
+        }
+        // ===== 阶段3追加结束 =====
+
+    说明：
+      - 需要在 SelfModelDetectService 中注入
+          @Resource StringRedisTemplate stringRedisTemplate;
+          @Resource ImageCleanupService imageCleanupService;
+      - 阶段2手动入口调用 detectAndSave 时传 customLocalImageName=null（走旧名无 "/"），
+        extractTaskUuidPrefix 返回空，整个 tryMarkBatchComplete 不执行，对现有链路无影响。
+      - extractTaskUuidPrefix 简单实现：
+          int slash = name.indexOf('/'); return slash>0 ? name.substring(0,slash) : "";
+
+----------------------------------------------------------------------
+4.6 数据清洗：阶段2手动 -> 阶段3自动触发
+----------------------------------------------------------------------
+
+  触发机制对比：
+
+  阶段2手动入口（原）：
+    前端 -> /test/image-recognition/run
+      返回结果后，前端单独调 POST /test/image-recognition/cleanup?localImageName=xxx
+        -> ImageCleanupService.cleanupSingleImage
+
+  阶段3自动入口（新）：
+    知眸回调入库  +-----+
+                     | 合流 -> 两边到齐 → 自动 cleanupSingleImage
+    自有模型入库  +-----+
+
+  实现位置（两个写入点）：
+    ZhimouTaskServiceImpl.handleImageCallback 末尾  (4.4 详述)
+    SelfModelDetectService.detectAndSave 入库之后    (4.5 详述)
+
+  ImageCleanupService：**零改动复用**。不关心触发源。
+
+  兜底：即便自动触发漏了某张（Redis丢数据/网络异常），
+       仍可用 /test/image-recognition/cleanup-all 批处理所有 clean_status=0 的记录
+       （与阶段2完全同入口）。
+
+----------------------------------------------------------------------
+4.7 批次状态（Redis）与图片状态（Redis）的衔接点
+----------------------------------------------------------------------
+
+  两类 Key 语义不同，不可混用：
+
+  【批次级】minio:flight:{TASK_UUID}
+    生命周期：PROCESSING (TTL 30min) → COMPLETED (永久)
+    写入点：
+      PROCESSING  → MinioPollingService.tryAcquireBatchLock (SET NX EX)
+      PROCESSING  → MinioPollingService.releaseBatchLock (DEL, 仍在同步时)
+      COMPLETED   → 两个入库点发现"该 taskUuid 下所有图片级 key 都已清理"
+                   (tryMarkBatchCompleteByTaskUuid)
+    读取点：
+      MinioPollingService 每轮扫描 -> 若 PROCESSING 或 COMPLETED 跳过
+
+  【图片级】minio:flight:img:{TASK_UUID/baseName}  HASH
+    字段：zhimou=1 / self=1
+    TTL：7 天
+    写入点：
+      zhimou=1 → ZhimouTaskServiceImpl.handleImageCallback
+      self=1   → SelfModelDetectService.detectAndSave
+    读取点：
+      每次写入后立即 entries() 检查两个字段是否同时存在
+      是 → cleanupSingleImage → DEL 本图片级 key → 尝试标记批次完成
+    删除触发：
+      - 清洗成功后 delete
+      - 或 7 天自动过期（若某张只有一边有结果，属异常，过期后不影响批次 COMPLETED 判定
+        因为 tryMarkBatchCompleteByTaskUuid 用 keys "minio:flight:img:{taskUuid}*"
+        扫描，过期后就扫不到了，自然能顺利标记 COMPLETED，逻辑自洽）。
+
+  tryMarkBatchCompleteByTaskUuid 的完整实现（两个 Service 中分别写会冗余，建议
+    抽到 ImageCleanupService 新增 public 方法，两边都调它）：
+
+      public void tryCompleteMinioBatch(String taskUuid, MinioProperties props) {
+          Set<String> pending = stringRedisTemplate.keys("minio:flight:img:" + taskUuid + "*");
+          if (pending == null || pending.isEmpty()) {
+              stringRedisTemplate.opsForValue().set("minio:flight:" + taskUuid, "COMPLETED");
+              if (props.isCleanupTempAfter()) {
+                  Path tempDir = Paths.get(props.getTempDir(), taskUuid);
+                  FileUtil.del(tempDir.toFile()); // hutool cn.hutool.core.io.FileUtil
+                  log.info("[MinIO批次] 标记完成并删除临时目录 taskUuid={}", taskUuid);
+              }
+          }
+      }
+
+  注意：此方法若被两个回调线程"几乎同时"进入 -> 可能两次 set COMPLETED 与两次
+       FileUtil.del。两者都是幂等，不会有并发问题。
+
+----------------------------------------------------------------------
+4.8 临时目录、清理、失败重试的衔接
+----------------------------------------------------------------------
+
+  目录结构（推荐）：
+    下载暂存区：{minio.temp-dir}/{TASK_UUID}/DJI_..._0001_V.jpeg ...  ← 阶段3专用
+    长期保留区：{zhimou.image.saveRootDir}/yyyyMMdd/DJI_...jpeg        ← 与阶段2共用
+
+  下载流程：
+    MinioClient.getObject(bucket, objectKey) → InputStream → Files.copy 到
+      temp-dir/TASK_UUID/filename  ← 批次整体独立，方便处理完成后整个文件夹 rm -rf
+
+  落盘长期保留区（两份 Service 内部仍会做）：
+    - ZhimouTaskServiceImpl.createAndReportImageBatch 内部仍按 L2111-L2118 把文件
+      从 temp-dir/TASK_UUID/filename copy 到 saveRootDir/yyyyMMdd/filename
+    - SelfModelDetectService.detectAndSave 同样 L70-L78 copy 到 saveRootDir/yyyyMMdd/...
+      （由于存在同一文件，copy 时使用 REPLACE_EXISTING 与原实现保持一致即可）
+
+  处理完成后删除 temp-dir/TASK_UUID/，避免磁盘积压。
+  失败场景：
+    - 如果 PROCESSING TTL 30min 过期仍没标记 COMPLETED，MinioPollingService
+      下一轮 scan 会"看到该 taskUuid 批次目录，但 Redis 没锁" → 重新 acquireLock。
+      由于 temp-dir/TASK_UUID 可能残留，processSingleBatch 开头需要先
+      tryMarkBatchComplete 检查后，若仍需处理 → 先删除旧 temp 目录再重新下载
+      （或覆盖下载，Files.copy REPLACE_EXISTING，也行）。
+
+  重试：运维接口 POST /api/minio/retry/{taskUuid}
+    操作：
+      DELETE minio:flight:{taskUuid}
+      DELETE minio:flight:img:{taskUuid}*
+      MinioPollingService.processSingleBatch(taskUuid)
+    （不删 DB，知眸和自有模型若重复调用需要先判断，但更安全做法是：重试只在
+      确认之前失败时调用；或者把"重复上报知眸"的风险交给知眸任务本身，因为 imageId
+      每次都是从 1 开始，新建知眸任务 taskId 不同，不会串回调。）
+
+----------------------------------------------------------------------
+4.9 前端展示 / 告警链路：无需改动的原因
+================================================================================
+
+  阶段2已实现的查询侧切换逻辑（TaskSwitchService L107-L111 + ApiController alerts 接口）：
+
+    alert_data_source = "video" -> SELECT * FROM zhimou_detection_result ...
+    alert_data_source = "image" -> SELECT * FROM zhimou_image_detection
+                                    WHERE clean_status != 0 ...
+
+  阶段3 写入的表：
+    - zhimou_image_detection   (clean_status 0 -> 1 或 2 由 ImageCleanupService 自动填)
+    - self_model_image_detection (用于清洗，不直接展示)
+
+  写入链路和查询链路在"clean_status != 0"处实现解耦：
+    - 阶段3 自动清洗完成后 clean_status=1/2 → 查询立刻能看到
+    - 还未清洗(clean_status=0) → 自动过滤掉，前端不会展示半成品数据
+  这就是"为什么前端零改动就能用"的原因。
+
+  screen-v3 中 dangerSum.vue / alerts.vue 已经适配 image 数据源
+  （阶段2已测），无需任何代码调整。
+
+
+================================================================================
+
+
+5. 修改影响矩阵
+================================================================================
+
+  代号说明：
+    [新] 新文件  [改] 已有文件少量修改  [零] 零改动直接复用
+
+  模块                文件/类                                          改动  阶段3使用到的方法/字段
+  ------------------- -----------------------------------------------  ----  --------------------------------------
+  配置                src/main/resources/application-company-a.yml      [改]  新增 minio:* 段
+                      src/main/resources/application-base.yml         [改]  新增 minio:* 默认段
+                      deploy-package/application-company-a.yml         [改]  同步 minio:* 段
+
+  MinIO SDK 接入     config/MinioProperties.java                       [新]  读取配置
+                      config/MinioConfig.java                           [新]  注入 MinioClient Bean
+
+  司空2 OpenAPI      openapi/DjiOpenApiClient.java                      [改]  新增 3 个 getFlightTask* 方法
+
+  图片触发逻辑       service/MinioPollingService.java                   [新]  @Scheduled + 分组/去重/下载/分派
+                      controller/MinioController.java                  [新]  运维重试 / 状态（可选）
+
+  识别统一入口       service/ImageRecognitionFacade.java                [新]  从 Controller 抽出的并行批处理 Facade
+                      controller/ImageRecognitionTestController.java   [改]  改为调用 Facade（可选，不强制）
+
+  知眸识别           service/impl/ZhimouTaskServiceImpl.java            [改]  (a) createAndReportImageBatch 增加带prefix重载
+                                                                              或抽取 local_image_name 构造
+                                                                         (b) handleImageCallback 入库后 +3 行
+                                                                              Redis + 触发清洗
+                      controller/ZhimouController.java                  [零]  callback 入口不变
+
+  自有模型识别       service/SelfModelDetectService.java                [改]  (a) detectAndSave 重载允许外部传
+                                                                              customLocalImageName
+                                                                         (b) 入库后 +3 行 Redis + 触发清洗
+
+  数据清洗           service/ImageCleanupService.java                   [零]  cleanupSingleImage / cleanupAllPending 完全复用
+                      + 新增 tryCompleteMinioBatch() 辅助方法            [改]  加 1 个 public 方法
+
+  开关检查           service/TaskSwitchService.java                      [零]  isImageTaskEnabled() 直接调用
+
+  查询/告警展示      controller/ApiController.java                       [零]  alerts 接口切换 clean_status 过滤不变
+                      screen-v3 alerts.vue / dangerSum.vue               [零]  数据契约同阶段2
+
+  表结构              zhimou_image_detection 表                          [零]  local_image_name 字段足够长(varchar 512 默认)
+                      self_model_image_detection 表                      [零]  同上
+
+
+================================================================================
+
+
+6. 附录：关键方法签名与参数对应表
+================================================================================
+
+  【阶段3 -> 知眸】
+  方法：ZhimouTaskService.createAndReportImageBatch(List<File> images,
+                                                     String aircraftSn,          // 阶段3 = detail API drone_sn
+                                                     String appId,                // 阶段3 = 配置 defaultAppId
+                                                     String applicationPackageId, // 阶段3 = 配置 defaultPkgId
+                                                     String imageBaseDir,         // 阶段3 = 配置 saveRootDir
+                                                     String customLocalImagePrefix) // 阶段3 = TASK_UUID
+  返回：zhimouTaskId (String)
+  内部：创建知眸 image 任务(taskId) -> 循环 reportImage -> 存 Redis zhimou:img:meta:*
+  回调：POST /api/zhimou/callback -> handleCallback(JsonNode root)
+    内部：按 (taskId, frameId) 读 meta -> 入库 zhimou_image_detection
+                      clean_status=0 -> (阶段3追加) Redis img:zhimou=1 -> 可能触发清洗
+
+  【阶段3 -> 自有模型】
+  方法：SelfModelDetectService.detectAndSave(File img,
+                                               BigDecimal threshold,     // 0.5 默认
+                                               String imageBaseDir,       // 同知眸
+                                               String customLocalImageName) // 阶段3 = TASK_UUID/baseWithoutExt
+  返回：SelfModelImageDetection
+  内部：multipart POST 192.168.2.200:5173/api/v1/detect -> 解析 detections
+        -> 入库 self_model_image_detection clean_status=0
+        -> (阶段3追加) Redis img:self=1 -> 可能触发清洗
+
+  【图片级自动清洗】
+  方法：ImageCleanupService.cleanupSingleImage(String localImageName)
+  时机：Redis 图片级 hash 同时含 zhimou=1 和 self=1 的"下一次写入"瞬间
+  效果：查两表 -> 距离匹配 -> clean_status 1/2
+
+  【批次级标记完成】
+  方法：ImageCleanupService.tryCompleteMinioBatch(String taskUuid, MinioProperties props)
+  时机：每次清洗成功后（delete img:key 后）立即尝试
+  效果：无 img:taskUuid/* 剩余 -> minio:flight:taskUuid=COMPLETED + 删除 temp 目录
+
+  【元数据获取】
+  方法：DjiOpenApiClient.getFlightTaskTrackDetail(defaultProjectUuid, taskUuid)
+    -> detail API 返回 flight_pieces[0].drone_sn
+  方法：DjiOpenApiClient.getFlightTaskInfo(taskUuid)
+    -> folder_info.expected_file_count / uploaded_file_count
+  方法：DjiOpenApiClient.getFlightTaskMedia(taskUuid)
+    -> list.size() 用于 MinIO 数量二次比对
+
+================================================================================
+ 文档结束
+================================================================================
