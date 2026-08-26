@@ -42,6 +42,8 @@ export interface DeviceDTO {
   lng?: number
   lat?: number
   flighttaskStepCode?: number
+  modeCode?: number  // mode_code(0待机,1-12工作,14未连接) - 地图过滤用
+  mqttActive?: boolean  // 5秒内有MQTT OSD上报 - 机场显示判断
 }
 
 export interface DeviceStatsDTO {

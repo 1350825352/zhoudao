@@ -99,6 +99,12 @@ function updateMapMarkers() {
     
     const deviceAddrs = store.devices
       .filter(d => d.lng != null && d.lat != null)
+      .filter(d => {
+        // 机场: 5秒内有MQTT OSD上报(mqttActive)才显示
+        if (d.kind === 'airport') return d.mqttActive === true
+        // 飞机: mode_code != 0(待机) 且 != 14(未连接) 才显示
+        return d.modeCode != null && d.modeCode !== 0 && d.modeCode !== 14
+      })
       .map(d => ({ name: d.name, kind: d.kind, lng: d.lng!, lat: d.lat! }))
     sessionStorage.setItem('addr', JSON.stringify(deviceAddrs))
     

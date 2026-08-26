@@ -1,9 +1,11 @@
 ================================================================================
-产品二期: 数据源开关 + 警情切换 - 阶段2开发说明
+产品二期: 数据源开关 + 警情切换 + 并行触发优化 - 阶段2开发说明
 ================================================================================
 开发日期: 2026-08-25
 开发目标: admin 页面数据源管理 + 视频任务开关 + 图片识别开关 + 警情数据源切换
-状态: 待开发
+          + 知眸/自有模型并行触发改造
+状态: 已完成
+提交: commit 50a76b3 (feat: 图片识别并行触发优化 + 警情图片预览样式调整)
 ================================================================================
 
 
@@ -15,6 +17,11 @@
 1. 视频流任务开关: 开启/关闭知眸视频流自动创建任务
 2. 图片识别任务开关: 开启/关闭图片识别流程
 3. 警情数据源切换: 切换警情信息显示的数据源(视频识别/图片识别已清洗)
+
+开发过程中新增的优化(方案外):
+4. 知眸(GPU)与自有模型(CPU)由串行触发改为并行触发
+5. 自有模型加 0.5 秒上传间隔
+6. screen-v3 警情图片预览框样式优化(解决留黑边)
 
 
 二、关键决策确认
@@ -37,6 +44,11 @@
 决策5: 切换按钮位置
   用户选择: 只在 admin-v3 左侧"换数据源"菜单
   (screen-v3 无需切换按钮, 自动读取全局设置)
+
+决策6: 知眸与自有模型触发方式(开发中新增)
+  用户选择: 并行触发
+  (知眸用 GPU 在远端服务器, 自有模型用 CPU 在本地/另一台机器, 硬件不冲突
+   两者无数据依赖, 仅最后的数据清洗需要两边结果都到齐, 故可同时开跑)
 
 
 三、数据库设计
@@ -74,7 +86,7 @@
   [Mapper]  TaskSwitchConfigMapper.java
             - extends BaseMapper<TaskSwitchConfig>
 
-  [Service] TaskSwitchService.java
+  [Service]  TaskSwitchService.java
             - getSwitchValue(key): 从 Redis 读取, 未命中查数据库
             - setSwitchValue(key, value): 更新数据库 + 更新 Redis
             - isVideoTaskEnabled(): 快捷方法, 返回 boolean
@@ -127,32 +139,66 @@
 
   修改文件: ImageRecognitionTestController.java
 
-  修改位置: /run 接口
+  修改位置: /run 接口开头
 
   逻辑:
     if (!taskSwitchService.isImageTaskEnabled()) {
-        return R.fail("图片识别任务已关闭, 请在admin换数据源页面开启");
+        return R.fail("图片识别任务已关闭, 请在 admin 换数据源页面开启 image_task 开关");
     }
 
   后续 MinIO 接入后:
     - MinIO 事件接收接口也检查此开关
     - 关闭时忽略所有 MinIO 事件
 
-4.5 警情查询接口改造
+4.5 知眸/自有模型并行触发改造(开发中新增, 核心优化)
+  ----------------------------
+  修改文件: ImageRecognitionTestController.java (POST /run 接口)
 
-  修改文件: ZhimouController.java
+  改造前: 串行触发 - 先跑知眸全部上报完, 再跑自有模型, 白白等待
+  改造后: 并行触发 - 知眸与自有模型各自独立线程同时开跑
 
-  修改位置: L244-L355 (getLatest, getPage, getById)
+  理由:
+    - 知眸用 GPU(远端服务器), 自有模型用 CPU(本地或另一台机器)
+    - 硬件互不冲突, 无数据依赖
+    - 仅最后的数据清洗需要两边结果都到齐(由前端收到知眸回调后再触发 /cleanup)
 
-  逻辑:
-    - 读取全局开关 switch:alert_data_source
-    - value=video (默认): 查 zhimou_detection_result 表
-    - value=image: 查 zhimou_image_detection 表, 条件 clean_status != 0
-    - 返回 VO 字段统一 (前端无感知)
+  实现要点:
+    - 知眸线程 zhimou-image-batch: 调 createAndReportImageBatch 批量上报
+    - 自有模型线程 self-model-detect: 循环调 detectAndSave, 每张间隔 0.5 秒
+    - 主线程 join() 等两个子线程"上报/识别动作"完成(不等知眸回调)
+    - 用 final 数组承接子线程结果, 主线程返回时读取
 
-  同时修改 /alerts 接口 (screen-v3 调用):
-    - 后端内部读取全局开关, 决定查哪张表
-    - 前端无需传 source 参数, 无需感知切换
+  自有模型 0.5 秒间隔:
+    for (File imgFile : imageFiles) {
+        selfModelDetectService.detectAndSave(imgFile, threshold, imageBaseDir);
+        Thread.sleep(500); // 0.5 秒, 降低 CPU 瞬时占用
+    }
+
+  并行验证日志(关键节点带时间戳 HH:mm:ss.SSS):
+    - [并行-知眸] >>> 主线程准备启动知眸线程
+    - [并行-知眸] === 知眸线程开始执行
+    - [并行-自有] === 自有模型线程开始执行
+    - [并行-自有] --- 处理第 N/16 张 file=xxx
+    - [并行-知眸] === 知眸线程结束(批量上报完成)
+    - [并行-自有] === 自有模型线程结束 success=X, fail=Y
+    - [并行-主] 两个子线程均结束, 汇总结果
+  判断标准: 两线程"=== 开始执行"时间戳相差几毫秒, 日志交错出现
+
+4.6 警情查询接口改造
+  ----------------------------
+  涉及两个文件, 注意区分:
+
+  (1) 知眸自己的警情查询接口
+      修改文件: ZhimouController.java (L244-L355, getLatest/getPage/getById)
+      逻辑: 读取全局开关, video 查 zhimou_detection_result, image 查 zhimou_image_detection(clean_status!=0)
+
+  (2) screen-v3 调用的 /alerts 接口  ⭐
+      修改文件: ApiController.java (L562-L621)  ← 不是 ZhimouController
+      逻辑:
+        - image 模式: 查 zhimou_image_detection WHERE clean_status != 0,
+                      appName 统一为 "AI图片识别"
+        - video 模式(默认): 原逻辑不变, 查 zhimou_detection_result
+      前端无需传 source 参数, 后端内部读取全局开关路由到正确的表
 
 
 五、前端 admin-v3 实现
@@ -173,6 +219,11 @@
     - 修改时调用 PUT /api/task-switch/{key}
     - 页面加载时调用 GET /api/task-switch 获取当前状态
 
+  注意: 请求 URL 不要重复加 /api 前缀
+    .env 已设 VITE_API_BASE_URL='/api', axios 自动加前缀
+    正确: request.get('/task-switch')
+    错误: request.get('/api/task-switch')  → 实际请求 /api/api/task-switch → 404
+
 5.2 新增路由 src/router/index.ts
 
   {
@@ -183,10 +234,11 @@
   }
 
 5.3 新增菜单项 src/layout/index.vue
+  注意: admin-v3 菜单是硬编码在 layout/index.vue, 不是从路由配置自动渲染
 
-  在 el-menu 中新增:
+  在 el-menu 中新增(位置: 算法配置 与 工单管理 之间):
     <el-menu-item index="/data-source">
-      <el-icon><.../></el-icon>
+      <el-icon><Connection/></el-icon>
       <span>换数据源</span>
     </el-menu-item>
 
@@ -198,10 +250,19 @@
 
 六、前端 screen-v3
 --------------------------------------------------------------------------------
-  无需改动
-
+6.1 警情数据源(无需改逻辑代码)
   原因: 后端 /alerts 接口内部读取全局开关, 自动路由到正确的表
   screen-v3 警情页面 (dangerSum.vue) 调用 /alerts 接口, 无需感知数据源切换
+
+6.2 图片预览框样式优化(开发中新增)
+  修改文件: qianduan/screen-v3/src/views/home/dangerSum.vue
+
+  问题: 点击警情图片放大预览时, 展示框留黑边过多, 框大于图片
+  修复: 调整 .preview-content / .preview-img-container / .preview-img 样式
+    - 去掉固定宽度, 改用 max-width/max-height
+    - max-width: calc(100vw - 80px), max-height: 70vh
+    - display: inline-block + overflow: hidden, 让框紧贴图片边缘
+    - 保留缩放/拖拽/左右切换功能
 
 
 七、改造范围清单
@@ -214,12 +275,15 @@
 新增Service TaskSwitchService.java                  开关服务(含Redis缓存)
 新增Controller TaskSwitchController.java            开关管理接口
 修改Service ZhimouTaskServiceImpl.java             自动调度加开关检查+立即关闭
-修改Controller ZhimouController.java                警情查询加数据源切换
-修改Controller ImageRecognitionTestController.java 测试入口加开关检查
+修改Controller ZhimouController.java                知眸警情查询加数据源切换
+修改Controller ApiController.java                  /alerts 接口加数据源切换(⭐screen-v3用)
+修改Controller ImageRecognitionTestController.java 测试入口加开关检查 + 并行触发 + 0.5s间隔 + 日志
 新增前端  admin-v3/src/views/data-source/index.vue  数据源管理页面
 修改前端  admin-v3/src/router/index.ts              新增路由
-修改前端  admin-v3/src/layout/index.vue             新增菜单项
+修改前端  admin-v3/src/layout/index.vue             新增菜单项(硬编码)
 修改前端  admin-v3/src/api/*.ts                     新增开关管理API
+修改前端  screen-v3/src/views/home/dangerSum.vue     图片预览框样式优化
+新增配置 test-req.json                              图片识别测试请求JSON(cmd下用 -d @文件 避免引号问题)
 
 
 八、交互流程
@@ -253,35 +317,117 @@
     ↓
     返回图片识别结果(已清洗)
 
+8.3 图片识别并行触发流程(新增)
+
+  POST /api/test/image-recognition/run (image_task 开关需=1)
+    ↓
+  扫描 testimage 目录 16 张图
+    ↓
+  同时启动两个线程:
+    ├─ zhimou-image-batch 线程: 批量上报知眸(每张1秒间隔, 知眸限制)
+    └─ self-model-detect 线程:  同步识别(每张0.5秒间隔)
+    ↓
+  主线程 join 等两个子线程上报/识别完成(不等知眸回调)
+    ↓
+  返回 {zhimouTaskId, selfModelSuccess, selfModelFail, cleanupHint}
+    ↓
+  知眸异步回调陆续到达 → 入库 zhimou_image_detection
+    ↓
+  前端收到回调到齐后调用 /cleanup-all 触发清洗
+
 
 九、文件位置速查
 --------------------------------------------------------------------------------
 - 知眸配置:        src/main/resources/application-company-a.yml (L65-76)
+- 知眸图片目录:    H:/traeproject/zhoudao/zhimou-images (配置 save-root-dir)
 - 自动调度入口:    ZhimouTaskServiceImpl.java (L122)
-- 警情查询接口:    ZhimouController.java (L244-L355)
-- 图片测试入口:    ImageRecognitionTestController.java
+- 知眸警情查询:    ZhimouController.java (L244-L355)
+- /alerts 接口:    ApiController.java (L562-L621)  ← screen-v3 调用
+- 图片测试入口:    ImageRecognitionTestController.java (并行触发在此)
+- 测试请求文件:    test-req.json (根目录, cmd 下用 -d @文件)
 - admin-v3 路由:   qianduan/admin-v3/src/router/index.ts
 - admin-v3 布局:   qianduan/admin-v3/src/layout/index.vue
+- admin-v3 数据源: qianduan/admin-v3/src/views/data-source/index.vue
 - screen-v3 警情:  qianduan/screen-v3/src/views/home/dangerSum.vue
 - screen-v3 API:   qianduan/screen-v3/src/api/uav.ts
 
 
 十、测试验证清单
 --------------------------------------------------------------------------------
-[ ] 数据库 task_switch_config 表创建成功, 初始化3条数据
-[ ] GET /api/task-switch 返回3个开关状态
-[ ] PUT /api/task-switch/video_task?value=0 关闭视频任务
-[ ] 关闭视频任务后, 所有 zhimou_status=1 的 live_stream 被关闭
-[ ] 开启视频任务后, 自动调度恢复正常
-[ ] PUT /api/task-switch/image_task?value=1 开启图片识别
-[ ] 图片识别开启后, /test/image-recognition/run 可以正常调用
-[ ] 图片识别关闭后, /test/image-recognition/run 返回提示
-[ ] PUT /api/task-switch/alert_data_source?value=image 切换警情数据源
-[ ] screen-v3 警情页面显示图片识别结果(已清洗)
-[ ] PUT /api/task-switch/alert_data_source?value=video 切换回视频识别
-[ ] screen-v3 警情页面恢复显示视频识别结果
-[ ] admin-v3 左侧菜单显示"换数据源"菜单项
-[ ] admin-v3 "换数据源"页面显示3个开关/切换
+[x] 数据库 task_switch_config 表创建成功, 初始化3条数据
+[x] GET /api/task-switch 返回3个开关状态
+    实测: {"video_task":"1","image_task":"1","alert_data_source":"image"}
+[x] PUT /api/task-switch/image_task?value=1 开启图片识别
+[x] 图片识别开启后, /test/image-recognition/run 可以正常调用
+[x] 图片识别关闭后, /test/image-recognition/run 返回提示
+[x] PUT /api/task-switch/alert_data_source?value=image 切换警情数据源
+[x] screen-v3 警情页面显示图片识别结果(已清洗)
+    实测: /alerts 返回 32 条 appName="AI图片识别" 记录
+[x] admin-v3 左侧菜单显示"换数据源"菜单项
+[x] admin-v3 "换数据源"页面显示3个开关/切换
+[x] 并行触发验证: 两线程同一毫秒(19:09:03.282)启动, 日志交错输出
+[x] 自有模型 0.5 秒间隔验证: 每张间隔约 1.0-1.1s(识别0.5s+间隔0.5s)
+[x] 知眸回调到齐: 16张约17秒(19:09:04→19:09:21), 非估算的8分钟
+[x] 数据清洗: /cleanup-all 返回 16 条
+[ ] PUT /api/task-switch/video_task?value=0 关闭视频任务(未实测, 等飞行测试)
+[ ] 关闭视频任务后所有 zhimou_status=1 的 live_stream 被关闭(未实测)
+[ ] 开启视频任务后自动调度恢复正常(未实测)
+[ ] PUT /api/task-switch/alert_data_source?value=video 切换回视频识别(未实测)
+
+
+十一、开发中的坑与注意事项
+--------------------------------------------------------------------------------
+坑1: admin-v3 请求 URL 重复加 /api 前缀 → 404
+  .env 设 VITE_API_BASE_URL='/api', axios 自动加前缀
+  页面代码再写 '/api/task-switch' → 实际请求 /api/api/task-switch → 404
+  修复: 页面写 '/task-switch', 不带 /api
+
+坑2: 知眸图片保存目录权限异常 → AccessDeniedException
+  原配置指向旧项目目录 H:/traeproject/ceshisikongapiAI/zhimou-images
+  修复: 改为 H:/traeproject/zhoudao/zhimou-images 并创建目录
+  配置文件: application-company-a.yml 的 zhimou.openapi.save-root-dir
+
+坑3: cmd 下 curl 传 JSON body 失败 → 400 Bad Request
+  cmd 不认单引号字符串, -d '{\"key\":\"val\"}' 传给后端的 body 损坏
+  修复: JSON 写到文件, 用 -d @文件 (test-req.json)
+  或改用 PowerShell, 单引号写法 -d '{\"key\":\"val\"}'
+
+坑4: "知眸回调 28秒/张, 8分钟到齐" 的估算严重高估
+  来源: 设计文档风险章节的拍脑袋估算值, 无实测依据
+  实测: 知眸 GPU 推理几乎实时, 每张回调延迟约 0.6-1 秒
+        16 张全部到齐约 17 秒, 远非 8 分钟
+  修复: 已从代码 cleanupHint 文案中去掉 "28秒/张" 误导性数字
+
+
+十二、实测结果(2026-08-25 19:09)
+--------------------------------------------------------------------------------
+测试命令:
+  curl.exe -s -X POST "http://localhost:8080/api/test/image-recognition/run" \
+    -H "Content-Type: application/json" \
+    -d "@H:\traeproject\zhoudao\test-req.json"
+
+测试数据: testimage 目录 16 张无人机实拍图
+
+时序:
+  19:09:03.282  知眸线程开始执行    (线程: mou-image-batch)
+  19:09:03.282  自有模型线程开始执行 (线程: lf-model-detect)  ← 同一毫秒
+  19:09:04.305  知眸上报成功 imageId=1
+  19:09:04.901  知眸回调入库 frameId=1  (上报后仅0.6秒回调)
+  ...两边日志交错输出...
+  19:09:21.390  知眸回调入库 frameId=16 (最后一张)
+  19:09:21.835  知眸线程结束(批量上报完成)
+  19:09:22.744  自有模型线程结束 success=16 fail=0
+  19:09:22.744  主线程汇总结果
+
+关键数据:
+  - 知眸 taskId: 1585751163663678800
+  - 自有模型: 16 张全部成功, 0 失败
+  - 知眸回调: 16 张全部到齐, 耗时约 17 秒(非8分钟)
+  - 知眸命中: frame 11/12/14/15 (hit=1/1/2/1)
+  - 数据清洗: /cleanup-all 返回 16 条
+  - /alerts: 数据源 image 生效, 返回图片识别记录, appName="AI图片识别"
+
+总耗时: 约 19 秒完成上报+识别(串行需37秒, 并行节省近一半)
 
 
 ================================================================================

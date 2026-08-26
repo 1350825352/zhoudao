@@ -93,6 +93,10 @@ public class ApiController {
         private Double lng;
         private Double lat;
         private Integer flighttaskStepCode;
+        /** 飞行器模式(0待机,1-12工作,14未连接) - 地图过滤用 */
+        private Integer modeCode;
+        /** 5秒内是否有MQTT OSD上报(update_time) - 机场地图显示判断用 */
+        private Boolean mqttActive;
     }
 
     @Data
@@ -205,9 +209,20 @@ public class ApiController {
             dto.setStatus(statusStr);
 
             DeviceRealtimeStatus rs = rsMap.get(d.getSn());
-            if (rs != null && rs.getLongitude() != null && rs.getLatitude() != null) {
-                dto.setLng(rs.getLongitude().doubleValue());
-                dto.setLat(rs.getLatitude().doubleValue());
+            if (rs != null) {
+                if (rs.getLongitude() != null && rs.getLatitude() != null) {
+                    dto.setLng(rs.getLongitude().doubleValue());
+                    dto.setLat(rs.getLatitude().doubleValue());
+                }
+                // 二期新增: 飞机mode_code(地图过滤用)
+                if (rs.getDeviceMode() != null) {
+                    dto.setModeCode(rs.getDeviceMode());
+                }
+                // 二期新增: 5秒内有MQTT OSD上报(update_time) - 机场显示判断
+                dto.setMqttActive(rs.getUpdateTime() != null
+                        && java.time.Duration.between(rs.getUpdateTime(), java.time.LocalDateTime.now()).getSeconds() <= 5);
+            } else {
+                dto.setMqttActive(false);
             }
 
             if ("airport".equals(dto.getKind())) {
