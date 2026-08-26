@@ -103,6 +103,7 @@ export interface LineDTO {
   modiTime: string
   waylineUuid?: string
   downloadUrl?: string
+  waypointCount?: number
 }
 
 export interface ExecuteFlightTaskDTO {

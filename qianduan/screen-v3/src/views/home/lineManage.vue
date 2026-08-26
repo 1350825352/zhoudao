@@ -12,7 +12,7 @@
         <div class="line-info">
           <div class="line-name">{{ item.fileName }}</div>
           <div class="line-detail">
-            <span class="detail-item">航点数: {{ getWaypointCount(item.waylineUuid) }}</span>
+            <span class="detail-item">航点数: {{ getWaypointCount(item) }}</span>
             <span class="detail-divider">|</span>
             <span class="detail-item">{{ formatTime(item.modiTime) }}</span>
           </div>
@@ -116,7 +116,7 @@ const formatTime = (timestamp: string): string => {
   return `${year}-${month}-${day} ${hours}:00`
 }
 
-const getLocalRoutes = (): { waylineUuid: string; waylineName: string; waypoints: Waypoint[] }[] => {
+const getLocalRoutes = (): { waylineUuid: string; waylineName: string; waypoints: Waypoint[]; modiTime?: string }[] => {
   try {
     const data = localStorage.getItem(LOCAL_STORAGE_KEY)
     return data ? JSON.parse(data) : []
@@ -125,25 +125,38 @@ const getLocalRoutes = (): { waylineUuid: string; waylineName: string; waypoints
   }
 }
 
-const getWaypointCount = (waylineUuid: string): string => {
+const getWaypointCount = (item: LineRow): string => {
   const routes = getLocalRoutes()
-  const route = routes.find(r => r.waylineUuid === waylineUuid)
+  const route = routes.find(r => r.waylineUuid === item.waylineUuid)
   if (route && route.waypoints && route.waypoints.length > 0) {
     return `${route.waypoints.length}个`
+  }
+  if (item.waypointCount && item.waypointCount > 0) {
+    return `${item.waypointCount}个`
   }
   return '未缓存'
 }
 
-const getLocalRouteByUuid = (waylineUuid: string): { waylineName: string; waypoints: Waypoint[] } | null => {
+const getLocalRouteByUuid = (waylineUuid: string, modiTime?: string): { waylineName: string; waypoints: Waypoint[] } | null => {
   const routes = getLocalRoutes()
   const route = routes.find(r => r.waylineUuid === waylineUuid)
-  return route ? { waylineName: route.waylineName, waypoints: route.waypoints } : null
+  if (!route) return null
+  // 缓存过期判断: 航线更新时间(modiTime)变化或旧缓存无modiTime则重新下载
+  if (modiTime && route.modiTime !== modiTime) return null
+  return { waylineName: route.waylineName, waypoints: route.waypoints }
 }
 
 const loadLines = async () => {
   try {
     const res = await deviceApi.getLineList()
     tableData.value = res.data
+    // 只清理已不存在的航线缓存, 保留已有航点数显示(modiTime变化时getLocalRouteByUuid会自动失效)
+    const validUuids = new Set(res.data.map((l: LineRow) => l.waylineUuid))
+    const routes = getLocalRoutes()
+    const filtered = routes.filter(r => validUuids.has(r.waylineUuid))
+    if (filtered.length !== routes.length) {
+      localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(filtered))
+    }
   } catch (e) {
     console.warn('获取航线列表失败', e)
   }
@@ -327,7 +340,7 @@ const parseWaylineFile = async (content: string, isKmz: boolean, arrayBuffer?: A
 }
 
 const handleLineClick = async (item: LineRow) => {
-  const localRoute = getLocalRouteByUuid(item.waylineUuid || '')
+  const localRoute = getLocalRouteByUuid(item.waylineUuid || '', item.modiTime)
   
   if (localRoute && localRoute.waypoints.length > 0) {
     store.updateCurrentRoute({
@@ -347,8 +360,8 @@ const handleLineClick = async (item: LineRow) => {
   try {
     ElMessage.info('正在加载航线数据...')
     
-    const proxyUrl = `/api/wayline/download?url=${encodeURIComponent(item.downloadUrl)}`
-    const response = await fetch(proxyUrl)
+    const proxyUrl = `/api/wayline/download?url=${encodeURIComponent(item.downloadUrl)}&_t=${Date.now()}`
+    const response = await fetch(proxyUrl, { cache: 'no-cache' })
     
     if (!response.ok) {
       ElMessage.error('下载航线文件失败')
@@ -380,12 +393,12 @@ const handleLineClick = async (item: LineRow) => {
     
     try {
       const existingData = localStorage.getItem(LOCAL_STORAGE_KEY)
-      let routes: { waylineUuid: string; waylineName: string; waypoints: Waypoint[] }[] = existingData ? JSON.parse(existingData) : []
+      let routes: { waylineUuid: string; waylineName: string; waypoints: Waypoint[]; modiTime?: string }[] = existingData ? JSON.parse(existingData) : []
       const index = routes.findIndex(r => r.waylineUuid === item.waylineUuid)
       if (index >= 0) {
-        routes[index] = { waylineUuid: item.waylineUuid || '', waylineName: item.fileName || '', waypoints }
+        routes[index] = { waylineUuid: item.waylineUuid || '', waylineName: item.fileName || '', waypoints, modiTime: item.modiTime }
       } else {
-        routes.push({ waylineUuid: item.waylineUuid || '', waylineName: item.fileName || '', waypoints })
+        routes.push({ waylineUuid: item.waylineUuid || '', waylineName: item.fileName || '', waypoints, modiTime: item.modiTime })
       }
       localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(routes))
     } catch {}

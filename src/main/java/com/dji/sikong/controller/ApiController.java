@@ -141,6 +141,7 @@ public class ApiController {
         private String modiTime;
         private String waylineUuid;
         private String downloadUrl;
+        private Integer waypointCount;
     }
 
     @Data
@@ -565,6 +566,7 @@ public class ApiController {
                 }
                 dto.setWaylineUuid(uuid);
                 dto.setDownloadUrl(wayline.getWpmlDownloadUrl());
+                dto.setWaypointCount(wayline.getWaypointCount());
                 result.add(dto);
             }
         } catch (Exception e) {

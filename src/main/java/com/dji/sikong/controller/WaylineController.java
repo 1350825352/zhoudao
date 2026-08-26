@@ -112,6 +112,9 @@ public class WaylineController {
             conn.setConnectTimeout(30000);
             conn.setReadTimeout(60000);
             conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+            // 避免CDN缓存返回旧航线文件(航线同步后内容可能变了但URL没变)
+            conn.setRequestProperty("Cache-Control", "no-cache");
+            conn.setRequestProperty("Pragma", "no-cache");
             
             int responseCode = conn.getResponseCode();
             if (responseCode != HttpURLConnection.HTTP_OK) {

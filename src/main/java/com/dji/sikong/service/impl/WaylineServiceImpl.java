@@ -135,15 +135,19 @@ public class WaylineServiceImpl extends ServiceImpl<WaylineMapper, Wayline> impl
                 }
                 try { w.setRawJson(node.toString()); } catch (Exception ignore) {}
 
-                if (StrUtil.isBlank(w.getWpmlDownloadUrl()) && StrUtil.isNotBlank(wuuid)) {
+                // ⭐ 每次同步都获取最新 download_url 和航点数(航线更新后 download_url 中的 auth_key 会变, 旧URL可能过期或指向旧文件)
+                if (StrUtil.isNotBlank(wuuid)) {
                     try {
                         JsonNode detail = openApiClient.getWaylineDetail(puuid, wuuid);
                         if (detail != null && detail.has("data")) {
-                            JsonNode data = detail.get("data");
-                            if (data.has("download_url")) {
-                                w.setWpmlDownloadUrl(data.get("download_url").asText());
-                            } else if (data.has("wpml_download_url")) {
-                                w.setWpmlDownloadUrl(data.get("wpml_download_url").asText());
+                            JsonNode detailData = detail.get("data");
+                            if (detailData.has("download_url")) {
+                                w.setWpmlDownloadUrl(detailData.get("download_url").asText());
+                            } else if (detailData.has("wpml_download_url")) {
+                                w.setWpmlDownloadUrl(detailData.get("wpml_download_url").asText());
+                            }
+                            if (detailData.has("wayline_point_nums")) {
+                                w.setWaypointCount(detailData.get("wayline_point_nums").asInt());
                             }
                         }
                     } catch (Exception e) {
