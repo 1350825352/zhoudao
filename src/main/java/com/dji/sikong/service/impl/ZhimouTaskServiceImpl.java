@@ -19,6 +19,7 @@ import com.dji.sikong.entity.LiveStream;
 import com.dji.sikong.entity.Wayline;
 import com.dji.sikong.entity.ZhimouDetectionResult;
 import com.dji.sikong.entity.ZhimouImageDetection;
+import com.dji.sikong.entity.SelfModelImageDetection;
 import com.dji.sikong.entity.WorkOrder;
 import com.dji.sikong.entity.ZhimouTask;
 import com.dji.sikong.entity.ZhimouTaskConfig;
@@ -30,6 +31,7 @@ import com.dji.sikong.mapper.ZhimouDetectionResultMapper;
 import com.dji.sikong.mapper.ZhimouTaskMapper;
 import com.dji.sikong.mqtt.DjiMqttClient;
 import com.dji.sikong.openapi.ZhimouOpenApiClient;
+import com.dji.sikong.service.ImageCleanupService;
 import com.dji.sikong.service.ZhimouTaskService;
 import com.fasterxml.jackson.databind.JsonNode;
 import lombok.extern.slf4j.Slf4j;
@@ -73,6 +75,10 @@ public class ZhimouTaskServiceImpl extends ServiceImpl<ZhimouTaskMapper, ZhimouT
     @Resource
     private com.dji.sikong.mapper.ZhimouImageDetectionMapper zhimouImageDetectionMapper;
 
+    /** 阶段3新增: 自有模型图片识别结果表 Mapper (用于 isBothSideCleaned DB 兜底检查) */
+    @Resource
+    private com.dji.sikong.mapper.SelfModelImageDetectionMapper selfModelImageDetectionMapper;
+
     @Resource
     private LiveStreamMapper liveStreamMapper;
 
@@ -87,6 +93,9 @@ public class ZhimouTaskServiceImpl extends ServiceImpl<ZhimouTaskMapper, ZhimouT
 
     @Resource
     private com.dji.sikong.config.DjiOpenApiProperties openApiProperties;
+
+    @Resource
+    private ImageCleanupService imageCleanupService;
 
     @Resource
     private com.dji.sikong.service.MediaServerStreamProbeService streamProbeService;
@@ -1519,9 +1528,151 @@ public class ZhimouTaskServiceImpl extends ServiceImpl<ZhimouTaskMapper, ZhimouT
                 lon != null ? lon.toPlainString() : "N/A",
                 alt != null ? alt.toPlainString() : "N/A");
 
-        // 6. TODO 二期任务9: 触发数据清洗 (ImageCleanupService 实现)
+        // 6. 阶段3: 写入图片级 Redis 状态 + 自动触发数据清洗 (替换二期任务9 TODO)
+        triggerImageCleanupIfReady(localImageName);
 
         return null; // 图片表是另一个实体, 这里返回 null (与视频表返回类型兼容)
+    }
+
+    /**
+     * 阶段3新增：知眸回调入库/自有模型入库后统一调用：
+     *   写入 minio:flight:img:{localImageName} 当前侧字段(zhimou=1 或 self=1)，
+     *   若两侧都到齐 → 立刻调 ImageCleanupService.cleanupSingleImage 自动清洗
+     *   → 清洗后尝试标记所属 MinIO 批次完成（按 TASK_UUID 前缀）。
+     *
+     * 对阶段2手动入口"无害"：若仅一侧写入（如手动自测知眸但自有模型侧是旧分支未写self=1），
+     *   本函数仅写 hash 的一个字段，imgStatus 只有一个 field，不会触发清洗。
+     *
+     * @param localImageName 图片关联键，形式：
+     *   阶段2手动入口 = DJI_20260826130711_0001_V
+     *   阶段3MinIO入口 = {TASK_UUID}/DJI_..._0001_V  （含 "/"）
+     */
+    public void triggerImageCleanupIfReady(String localImageName) {
+        if (StrUtil.isBlank(localImageName)) return;
+        try {
+            String imgKey = "minio:flight:img:" + localImageName;
+            Map<Object, Object> imgStatus = stringRedisTemplate.opsForHash().entries(imgKey);
+            // 只要 clean_status 已经通过手动/其他侧洗过（cleaned=1 标过），直接跳过
+            String cleaned = imgStatus.get("cleaned") != null ? imgStatus.get("cleaned").toString() : null;
+            if ("1".equals(cleaned)) return;
+
+            // DB 兜底：如果 Redis key 不存在（已被清洗删除），查 DB 判断状态
+            if (imgStatus == null || imgStatus.isEmpty()) {
+                if (isBothSideCleaned(localImageName)) {
+                    log.info("[自动清洗] Redis key不存在但DB已清洗完成，直接标记批次 localImageName={}", localImageName);
+                    tryMarkBatchCompleteByPrefix(localImageName);
+                    return;
+                }
+            }
+
+            // 写 zhimou=1
+            stringRedisTemplate.opsForHash().put(imgKey, "zhimou", "1");
+            stringRedisTemplate.expire(imgKey, 7, TimeUnit.DAYS);
+
+            // 再读一次，确认两侧到齐
+            imgStatus = stringRedisTemplate.opsForHash().entries(imgKey);
+            boolean zhimouReady = "1".equals(imgStatus.get("zhimou") != null ? imgStatus.get("zhimou").toString() : null);
+            boolean selfReady = "1".equals(imgStatus.get("self") != null ? imgStatus.get("self").toString() : null);
+            if (zhimouReady && selfReady) {
+                log.info("[自动清洗] ⭐ 知眸与自有模型结果均到齐 → 启动 cleanup localImageName={}", localImageName);
+                try {
+                    imageCleanupService.cleanupSingleImage(localImageName);
+                    stringRedisTemplate.opsForHash().put(imgKey, "cleaned", "1");
+                    stringRedisTemplate.delete(imgKey);
+                } catch (Exception ce) {
+                    log.error("[自动清洗] 异常 localImageName={}", localImageName, ce);
+                }
+                tryMarkBatchCompleteByPrefix(localImageName);
+            }
+        } catch (Exception e) {
+            log.warn("[自动清洗] triggerImageCleanupIfReady 异常 localImageName={}", localImageName, e);
+        }
+    }
+
+    /**
+     * 阶段3新增：自有模型入库后写入 self=1，检查到齐后触发清洗（与知眸侧镜像对称）
+     * 放入 Service 层而不是 SelfModelDetectService 直接写，是为了复用 tryMarkBatchCompleteByPrefix。
+     */
+    public void triggerImageCleanupIfReadyForSelf(String localImageName) {
+        if (StrUtil.isBlank(localImageName)) return;
+        try {
+            String imgKey = "minio:flight:img:" + localImageName;
+            Map<Object, Object> imgStatus = stringRedisTemplate.opsForHash().entries(imgKey);
+
+            // DB 兜底：如果 Redis key 不存在（已被清洗删除），查 DB 判断状态
+            if (imgStatus == null || imgStatus.isEmpty()) {
+                if (isBothSideCleaned(localImageName)) {
+                    log.info("[自动清洗] Redis key不存在但DB已清洗完成，直接标记批次 localImageName={}", localImageName);
+                    tryMarkBatchCompleteByPrefix(localImageName);
+                    return;
+                }
+            }
+
+            // 写 self=1
+            stringRedisTemplate.opsForHash().put(imgKey, "self", "1");
+            stringRedisTemplate.expire(imgKey, 7, TimeUnit.DAYS);
+
+            imgStatus = stringRedisTemplate.opsForHash().entries(imgKey);
+            String cleaned = imgStatus.get("cleaned") != null ? imgStatus.get("cleaned").toString() : null;
+            if ("1".equals(cleaned)) return;
+            boolean zhimouReady = "1".equals(imgStatus.get("zhimou") != null ? imgStatus.get("zhimou").toString() : null);
+            boolean selfReady = "1".equals(imgStatus.get("self") != null ? imgStatus.get("self").toString() : null);
+            if (zhimouReady && selfReady) {
+                log.info("[自动清洗] ⭐ 自有模型与知眸结果均到齐 → 启动 cleanup localImageName={}", localImageName);
+                try {
+                    imageCleanupService.cleanupSingleImage(localImageName);
+                    stringRedisTemplate.opsForHash().put(imgKey, "cleaned", "1");
+                    stringRedisTemplate.delete(imgKey);
+                } catch (Exception ce) {
+                    log.error("[自动清洗] 异常 localImageName={}", localImageName, ce);
+                }
+                tryMarkBatchCompleteByPrefix(localImageName);
+            }
+        } catch (Exception e) {
+            log.warn("[自动清洗] triggerImageCleanupIfReadyForSelf 异常 localImageName={}", localImageName, e);
+        }
+    }
+
+    /**
+     * 检查指定 localImageName 在知眸和自有模型两侧是否都已完成清洗 (clean_status != 0)
+     * 用于 Redis key 丢失时的 DB 兜底判断
+     */
+    private boolean isBothSideCleaned(String localImageName) {
+        if (StrUtil.isBlank(localImageName)) return false;
+        try {
+            long zCount = zhimouImageDetectionMapper.selectCount(
+                    new LambdaQueryWrapper<ZhimouImageDetection>()
+                            .eq(ZhimouImageDetection::getLocalImageName, localImageName)
+                            .eq(ZhimouImageDetection::getDeleted, 0)
+                            .ne(ZhimouImageDetection::getCleanStatus, 0));
+            long sCount = selfModelImageDetectionMapper.selectCount(
+                    new LambdaQueryWrapper<SelfModelImageDetection>()
+                            .eq(SelfModelImageDetection::getLocalImageName, localImageName)
+                            .eq(SelfModelImageDetection::getDeleted, 0)
+                            .ne(SelfModelImageDetection::getCleanStatus, 0));
+            return zCount > 0 && sCount > 0;
+        } catch (Exception e) {
+            log.warn("[自动清洗] isBothSideCleaned 异常 localImageName={}", localImageName, e);
+            return false;
+        }
+    }
+
+    /**
+     * 阶段3新增：检查当前 localImageName 所属批次 TASK_UUID 下是否还有未清洗图片；
+     * 若本张 imgKey 已 delete，且 keys("minio:flight:img:{TASK_UUID}*") 为空
+     *   → minio:flight:{TASK_UUID}=COMPLETED 永久
+     *   → 调 ImageCleanupService.tryCompleteMinioBatch 删除 temp 目录
+     */
+    private void tryMarkBatchCompleteByPrefix(String localImageName) {
+        if (StrUtil.isBlank(localImageName)) return;
+        int slash = localImageName.indexOf('/');
+        if (slash <= 0) return; // 阶段2无前缀，跳过
+        String taskUuid = localImageName.substring(0, slash);
+        try {
+            imageCleanupService.tryCompleteMinioBatch(taskUuid);
+        } catch (Exception e) {
+            log.warn("[自动清洗] 标记批次完成异常 taskUuid={}", taskUuid, e);
+        }
     }
 
     /** 字符串转 BigDecimal, 失败/空 返回null */
@@ -2088,6 +2239,19 @@ public class ZhimouTaskServiceImpl extends ServiceImpl<ZhimouTaskMapper, ZhimouT
                                              String appId,
                                              String applicationPackageId,
                                              String imageBaseDir) {
+        // 阶段2旧签名：prefix=null + 1000ms间隔，完全保持原行为
+        return createAndReportImageBatch(imageFiles, aircraftSn, appId, applicationPackageId,
+                imageBaseDir, null, 1000L);
+    }
+
+    @Override
+    public String createAndReportImageBatch(List<File> imageFiles,
+                                             String aircraftSn,
+                                             String appId,
+                                             String applicationPackageId,
+                                             String imageBaseDir,
+                                             String customLocalImagePrefix,
+                                             long reportIntervalMs) {
         if (imageFiles == null || imageFiles.isEmpty()) {
             log.warn("[知眸-图片批量上报] 图片列表为空");
             return null;
@@ -2098,13 +2262,12 @@ public class ZhimouTaskServiceImpl extends ServiceImpl<ZhimouTaskMapper, ZhimouT
             log.error("[知眸-图片批量上报] 创建任务失败, 无法继续");
             return null;
         }
-        log.info("[知眸-图片批量上报] 创建任务成功 taskId={}, 待上报图片数={}", taskId, imageFiles.size());
+        log.info("[知眸-图片批量上报] 创建任务成功 taskId={}, 待上报图片数={}, prefix={}",
+                taskId, imageFiles.size(), customLocalImagePrefix);
 
-        // 2. 循环上报每张图片 (每次间隔1秒, 知眸限制每任务最小上报间隔1秒)
         long imageId = 1L;
         int success = 0, fail = 0;
-        // image_id 由调用方指定, 回调里原样返回为 data.frame.id (见接口文档)
-        // 所以 Redis meta key 直接用 imageId, 不需要 INCR
+        long interval = reportIntervalMs > 0 ? reportIntervalMs : 1000L;
 
         for (File srcFile : imageFiles) {
             try {
@@ -2117,17 +2280,21 @@ public class ZhimouTaskServiceImpl extends ServiceImpl<ZhimouTaskMapper, ZhimouT
                     Files.copy(srcFile.toPath(), targetPath, StandardCopyOption.REPLACE_EXISTING);
                 }
 
-                // 2.2 用文件名去掉扩展名作为 local_image_name
+                // 2.2 构造 local_image_name
+                //   - 阶段2手动入口 (customLocalImagePrefix==null): 沿用旧逻辑, 文件去扩展名
+                //   - 阶段3MinIO入口 (customLocalImagePrefix=taskUuid): 加前缀, 解决跨架次同名冲突
                 String fileName = srcFile.getName();
                 int dotIdx = fileName.lastIndexOf('.');
-                String localImageName = dotIdx > 0 ? fileName.substring(0, dotIdx) : fileName;
+                String baseName = dotIdx > 0 ? fileName.substring(0, dotIdx) : fileName;
+                String localImageName = StrUtil.isNotBlank(customLocalImagePrefix)
+                        ? customLocalImagePrefix + "/" + baseName
+                        : baseName;
 
                 // 2.3 提取 EXIF GPS
                 BigDecimal[] gps = ImageExifUtil.extractGps(srcFile);
                 BigDecimal lat = gps[0], lon = gps[1], alt = gps[2];
 
                 // 2.4 元数据存 Redis Hash, handleCallback 时用 (taskId, frame.id) 反查
-                //     key: zhimou:img:meta:{taskId}:{imageId}  (回调时 frame.id = image_id 原样返回)
                 String metaKey = "zhimou:img:meta:" + taskId + ":" + imageId;
                 Map<String, String> meta = new LinkedHashMap<>();
                 meta.put("local_image_name", localImageName);
@@ -2143,15 +2310,47 @@ public class ZhimouTaskServiceImpl extends ServiceImpl<ZhimouTaskMapper, ZhimouT
                 JsonNode r = reportImage(taskId, imageId, aircraftSn, imageBytes);
                 if (r != null) {
                     success++;
-                    log.info("[知眸-图片批量上报] 上报成功 taskId={}, imageId={}, fileName={}, gps=({},{}), alt={}",
-                            taskId, imageId, fileName,
-                            lat != null ? lat.toPlainString() : "N/A",
-                            lon != null ? lon.toPlainString() : "N/A",
-                            alt != null ? alt.toPlainString() : "N/A");
+                    log.info("[知眸-图片批量上报] 上报成功 taskId={}, imageId={}, fileName={}, localImageName={}",
+                            taskId, imageId, fileName, localImageName);
                 } else {
                     fail++;
-                    log.warn("[知眸-图片批量上报] 上报失败 taskId={}, imageId={}, fileName={}",
-                            taskId, imageId, fileName);
+                    log.warn("[知眸-图片批量上报] 上报失败(超时或API错误) taskId={}, imageId={}, fileName={}, localImageName={}",
+                            taskId, imageId, fileName, localImageName);
+                    // 2.5.1 失败兜底：创建 DB 记录 + 触发清洗检查，防止批次卡死
+                    try {
+                        ZhimouImageDetection failRec = new ZhimouImageDetection();
+                        failRec.setZhimouTaskId(taskId);
+                        failRec.setDeviceId(aircraftSn);
+                        failRec.setLocalImageName(localImageName);
+                        failRec.setLocalImagePath(dayDir + "/" + fileName);
+                        failRec.setImageWidth(0);
+                        failRec.setImageHeight(0);
+                        failRec.setFrameId(imageId);
+                        failRec.setLatitude(lat);
+                        failRec.setLongitude(lon);
+                        failRec.setAltitude(alt);
+                        failRec.setHitCount(0);
+                        failRec.setCleanStatus(1); // 1=已处理(失败)
+                        failRec.setCleanRemark("知眸上报失败(超时或API错误)");
+                        failRec.setCreateTime(LocalDateTime.now());
+                        zhimouImageDetectionMapper.insert(failRec);
+                        log.info("[知眸-图片批量上报] 失败兜底入库 taskId={}, localImageName={}", taskId, localImageName);
+
+                        // 2.5.2 设置 Redis 图片级状态
+                        String imgKey = "minio:flight:img:" + localImageName;
+                        Map<String, String> failMeta = new LinkedHashMap<>();
+                        failMeta.put("zhimou", "1");
+                        failMeta.put("failed", "1");
+                        stringRedisTemplate.opsForHash().putAll(imgKey, failMeta);
+                        stringRedisTemplate.expire(imgKey, 7, TimeUnit.DAYS);
+                        log.info("[知眸-图片批量上报] 失败兜底设置Redis key localImageName={}", localImageName);
+
+                        // 2.5.3 触发批次完成检查
+                        triggerImageCleanupIfReady(localImageName);
+                        log.info("[知眸-图片批量上报] 失败兜底触发清洗检查 localImageName={}", localImageName);
+                    } catch (Exception ex) {
+                        log.error("[知眸-图片批量上报] 失败兜底异常 localImageName={}", localImageName, ex);
+                    }
                 }
             } catch (Exception e) {
                 fail++;
@@ -2159,12 +2358,19 @@ public class ZhimouTaskServiceImpl extends ServiceImpl<ZhimouTaskMapper, ZhimouT
                         taskId, imageId, srcFile.getName(), e);
             }
             imageId++;
-            // 每次上报后等待1秒 (知眸限制: 每任务最小上报间隔1秒)
-            try { Thread.sleep(1000); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+            if (interval > 0) {
+                try { Thread.sleep(interval); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+            }
         }
         log.info("[知眸-图片批量上报] 完成 taskId={}, 总数={}, 成功={}, 失败={}",
                 taskId, imageFiles.size(), success, fail);
-        // 3. 不主动 deleteTask (等回调到达后由外部 Controller 调用 closeZhimouTask)
+        // 主动关闭知眸任务，释放并发名额（知眸并发仅2个）
+        try {
+            JsonNode stopResp = deleteTask(taskId);
+            log.info("[知眸-图片批量上报] 已主动关闭知眸任务 taskId={}, resp={}", taskId, stopResp);
+        } catch (Exception e) {
+            log.warn("[知眸-图片批量上报] 关闭知眸任务异常 taskId={}", taskId, e);
+        }
         return taskId;
     }
 

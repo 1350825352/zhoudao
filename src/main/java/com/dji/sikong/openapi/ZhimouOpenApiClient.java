@@ -531,10 +531,11 @@ public class ZhimouOpenApiClient {
             Map<String, String> headers = buildHeaders();
             headers.put("Content-Type", "application/octet-stream");
             String urlStr = url.toString();
-            log.info("[知眸-上报图片] POST url={}, bodySize={}bytes", urlStr, imageBytes.length);
+            log.info("[知眸-上报图片] POST url={}, bodySize={}bytes, timeout=10s", urlStr, imageBytes.length);
             HttpResponse resp = HttpRequest.post(urlStr)
                     .addHeaders(headers)
                     .body(imageBytes)
+                    .timeout(10000)
                     .execute();
             String respBody = resp.body();
             log.info("[知眸-上报图片] resp status={}, body={}", resp.getStatus(), respBody);
@@ -546,7 +547,7 @@ public class ZhimouOpenApiClient {
             }
             return root.has("data") ? root.get("data") : root;
         } catch (Exception e) {
-            log.error("[知眸-上报图片] 异常 taskId={}", taskId, e);
+            log.error("[知眸-上报图片] 异常 taskId={}, imageId={}, error={}", taskId, imageId, e.getMessage());
             return null;
         }
     }
