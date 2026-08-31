@@ -1,0 +1,182 @@
+================================================================================
+          二期图片识别 - 阶段2补充设计说明（照片告警解耦方案）
+================================================================================
+制定日期: 2026-08-31
+状态: 方案定稿（待实施）
+背景: 告警管理页面显示的图片是 MinIO 原图而非知眸标注图；一期/二期图片
+      文件混存；警情数据源全局单选切换无法同时查看两种告警。
+
+--------------------------------------------------------------------------------
+一、问题回顾（根因）
+--------------------------------------------------------------------------------
+
+1. 告警页显示原图的根因:
+   ZhimouController.buildImageResultVO() 无条件使用 localImagePath（MinIO 原图，
+   由 SelfModelDetectService 落盘），而命中记录的 zhimou_app_image（知眸标注图
+   相对URL）有值却未被使用。二期回调 handleImageCallback 只存路径不下载图片。
+
+2. 文件混存的根因:
+   SelfModelDetectService 落盘原图时 imageBaseDir 复用了一期的 saveRootDir
+   (zhimou-images/)，导致一期直播标注图与二期 MinIO 原图混在同一目录。
+
+3. 数据源单选的限制:
+   task_switch_config 表 alert_data_source(video/image) 全局单选，控制 admin
+   告警管理页与 screen 大屏的警情数据源，同一时间只能看一种告警。
+
+--------------------------------------------------------------------------------
+二、总体架构（方案3: 双页面并存 + 开关降级为大屏专用）
+--------------------------------------------------------------------------------
+
+admin (3201):
+  ├── 告警管理 /alarm        → 视频识别告警（一期）【现有，接口固定查一期表】
+  ├── 照片告警 /photo-alarm  → 照片识别告警（二期）【新增，固定查二期表】
+  └── 换数据源 /data-source  → "警情数据源"单选保留，语义改为"大屏警情数据源"
+
+screen (3202):
+  大屏警情模块 ← 仍读 alert_data_source 开关（零改动）
+
+核心原则: admin 两个告警页面固定各自数据源（不再读开关）；开关只管大屏。
+          video_task / image_task 两个识别任务开关保持原样不动。
+
+--------------------------------------------------------------------------------
+三、数据链路（照片告警全流程）
+--------------------------------------------------------------------------------
+
+MinIO 原图下载 (临时目录)
+    ├──→ 知眸识别 ──命中──→ 回调带 apps[0].image（标注图URL）
+    │                        ↓ 【新增】下载 → 转PNG → 落盘 annotated/
+    │                        ↓ 写 DB 字段 annotated_local_path
+    ├──→ 自有模型识别 ──→ 【改】原图落盘 original/（不再进一期目录）
+    ↓
+两侧到齐 → 清洗 clean_status=1
+    ↓
+照片告警页 ← /image-results/page（固定查二期表）
+             过滤 hit_count > 0
+             图片 = annotated_local_path 优先，原图兜底
+
+--------------------------------------------------------------------------------
+四、目录解耦（物理隔离）
+--------------------------------------------------------------------------------
+
+zhimou-images/{yyyyMMdd}/                     ← 一期视频专用（不再混入二期文件）
+└── 1788151503385_0c0800d3.png                （直播标注图，存量保留）
+
+zhimou-image-detect/                          ← 二期照片专用【新增根目录】
+└── {yyyyMMdd}/
+    └── {taskUuid}/                           ← 一个架次一个文件夹
+        ├── original/                         ← MinIO 原图
+        │   └── DJI_20260831124402_0013_V.jpeg
+        └── annotated/                        ← 知眸标注图（命中才落盘）
+            └── DJI_20260831124402_0013_V.png
+
+--------------------------------------------------------------------------------
+五、数据库变更
+--------------------------------------------------------------------------------
+
+ALTER TABLE zhimou_image_detection
+  ADD COLUMN annotated_local_path VARCHAR(255) DEFAULT NULL
+    COMMENT '知眸标注图本地相对路径 (20260831/{taskUuid}/annotated/xxx.png)';
+  ADD COLUMN work_order_id BIGINT DEFAULT NULL
+    COMMENT '工单ID(NULL=未处理,与一期语义一致)';
+
+历史数据清理（不做迁移，直接删除）:
+  TRUNCATE TABLE zhimou_image_detection;
+  TRUNCATE TABLE self_model_image_detection;
+  文件: 删除 zhimou-images/*/DJI_*.jpeg，保留 1788*.png（一期标注图）
+
+--------------------------------------------------------------------------------
+六、后端改动（6 处）
+--------------------------------------------------------------------------------
+
+1. ZhimouTaskServiceImpl.handleImageCallback
+   apps[0].image 非空时: 拼知眸 baseUrl 下载 → convertToPngBytes 转 PNG
+   → 存 annotated/ → 写 annotated_local_path；失败只 warn 不阻塞入库。
+
+2. SelfModelDetectService (原 L90-L98)
+   原图落盘路径改为 zhimou-image-detect/{date}/{taskUuid}/original/
+   （taskUuid 从 localImageName 前缀取，阶段3格式为 {taskUuid}/{fileName}）。
+
+3. ZhimouController 旧 GET /results/page
+   删除 alert_data_source 开关判断，固定走一期 pageResults。
+
+4. ZhimouController 新增 GET /image-results/page
+   固定查二期表；条件 clean_status!=0 AND hit_count>0；
+   支持 status(handled/unhandled 按 work_order_id)、aircraft_sn、时间筛选、分页。
+
+5. ZhimouController 新增 PUT /image-results/{id}/handle
+   标记已处理（写 work_order_id），照片告警页"处理"按钮用。
+
+6. ZhimouWebMvcConfig
+   新增静态映射: zhimou-image-detect/ → /image-detect-img/**
+
+buildImageResultVO 的 URL 逻辑:
+  image_http_url = annotated_local_path 非空
+      ? "/image-detect-img/" + annotated_local_path     // 知眸标注图（带框）
+      : "/image-detect-img/" + localImagePath;          // 兜底原图
+
+--------------------------------------------------------------------------------
+七、前端改动（4 处）
+--------------------------------------------------------------------------------
+
+1. admin-v3 src/router/index.ts
+   新增路由 /photo-alarm → views/photoAlarm/index.vue
+
+2. admin-v3 src/layout/index.vue
+   新增菜单项"照片告警"（Camera 图标，排在告警管理下方）
+
+3. admin-v3 src/views/photoAlarm/index.vue【新文件】
+   复制 alarm/index.vue: 接口改 /image-results/page，
+   处理按钮调 PUT /image-results/{id}/handle，
+   列微调（增加 hit_count 识别目标数列）。
+
+4. admin-v3 src/views/data-source/index.vue
+   "警情数据源"标签改为"大屏警情数据源"，
+   描述改为"仅控制大屏警情模块的数据源；admin 的告警管理/照片告警页面不受影响"。
+
+--------------------------------------------------------------------------------
+八、边界与兜底
+--------------------------------------------------------------------------------
+
+| 场景                          | 行为                                       |
+|-------------------------------|--------------------------------------------|
+| 知眸标注图下载失败/超时        | annotated_local_path=NULL, 显示原图, warn  |
+| hit_count>0 但回调无 image    | 异常数据, 显示原图兜底 + warn              |
+| 一期/二期文件同名冲突         | 物理目录隔离, 不存在冲突                   |
+| 大屏接口 ApiController#L582   | 零改动, 继续读 alert_data_source           |
+| 无目标照片(hit=0)             | 不进入照片告警列表                         |
+
+--------------------------------------------------------------------------------
+九、实施顺序
+--------------------------------------------------------------------------------
+
+1. DB: ALTER 加字段 + TRUNCATE 清理 + 删 DJI 原图文件
+2. 后端: 目录解耦（改动1、2）
+3. 后端: 接口（改动3、4、5、6）
+4. 前端: 照片告警页 + 菜单 + 文案（改动1~4）
+5. 编译重启 + 飞行验证:
+   ├── 照片告警页显示知眸标注图（带框）
+   ├── 告警管理页仍显示直播标注图（回归）
+   ├── 大屏跟随开关切换（回归）
+   └── 无目标照片不出现在照片告警列表
+6. git 提交
+
+--------------------------------------------------------------------------------
+十、关联背景（本次排查过程要点, 供后续参考）
+--------------------------------------------------------------------------------
+
+1. 验证方法: 直接读取 zhimou-images/20260831/1788151503385_0c0800d3.png 确认
+   一期直播标注图带橙色检测框+标签（小客车 e9su6b），证明一期链路正常。
+
+2. /results/page 分流逻辑: taskSwitchService.getAlertDataSource()=="image" 时走
+   pageImageResults()（查 zhimou_image_detection, 只过滤 clean_status!=0,
+   未过滤 hit_count, 且用 localImagePath 拼URL → 显示原图）。
+
+3. 知眸回调字段:
+   data.frame.image        = 知眸原始帧图相对URL（/openapi/{taskId}/images/xxx.jpg）
+   data.apps[0].image      = 知眸app标注图相对URL（/openapi/{taskId}/messages/{appId}/xxx.jpg）
+   二者均为知眸服务器上的相对路径, 需拼 openapi.baseUrl 下载。
+
+4. 一期告警状态机制: zhimou_detection_result.work_order_id NULL=未处理,
+   非空=已处理; 前端按此显示处理状态并筛选。
+
+================================================================================

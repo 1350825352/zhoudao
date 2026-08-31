@@ -101,8 +101,9 @@ router.beforeEach(async (to, from, next) => {
       })
       next('/dashboard')
       return
-    } catch (error) {
-      ElMessage.error('您没有权限登录管理后台，请联系管理员')
+    } catch (error: any) {
+      // 展示后端返回的真实原因：401=登录已过期，403=没有权限
+      ElMessage.error(error?.message || '登录验证失败，请重新登录')
       // 验证失败时清除token，避免死循环
       next('/login')
       return

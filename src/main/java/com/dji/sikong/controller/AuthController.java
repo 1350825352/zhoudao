@@ -47,13 +47,16 @@ public class AuthController {
             Map<String, Object> userInfo = (Map<String, Object>) userObj;
             Boolean hasAdminAccess = (Boolean) userInfo.get("hasAdminAccess");
 
-            log.info("[认证] token验证, username={}, dept={}, hasAdminAccess={}", 
+            log.info("[认证] token验证, username={}, dept={}, hasAdminAccess={}",
                     userInfo.get("username"), userInfo.get("dept"), hasAdminAccess);
 
             // 权限校验：只有信息中心和项目管理部门的人员能登录管理后台
             if (hasAdminAccess == null || !hasAdminAccess) {
                 return R.fail(403, "您没有权限登录管理后台，请联系管理员");
             }
+
+            // 滑动过期：每次校验成功重置2小时TTL，活跃用户不会被强制重新登录
+            redisTemplate.expire(TOKEN_PREFIX + token, 2, TimeUnit.HOURS);
 
             Map<String, Object> result = new HashMap<>();
             result.put("id", userInfo.get("id"));
