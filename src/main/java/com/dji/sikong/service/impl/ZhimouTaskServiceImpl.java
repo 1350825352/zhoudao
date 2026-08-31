@@ -1488,49 +1488,85 @@ public class ZhimouTaskServiceImpl extends ServiceImpl<ZhimouTaskMapper, ZhimouT
         String targetsJsonStr = null;
         String appId = null, appName = null, zhimouAppImage = null;
         String zapkId = root.path("zapk_id").asText(null);
+        // 修复: 一张图可能命中多个应用包(如汽车+人), 遍历全部 apps[] 合并结果
+        //   - totalHit: 所有 app 的 objects 累计
+        //   - appId/appName: 去重拼接(逗号分隔)
+        //   - 主标注图: 目标数最多的 app (与落盘逻辑配合, 其余 app 标注图也全量落盘)
+        java.util.List<String[]> hitAppImages = new java.util.ArrayList<>(); // [image, appId, appName, objCount]
         if (appsNode.isArray() && appsNode.size() > 0) {
-            JsonNode app0 = appsNode.get(0);
-            appId = app0.path("app_id").asText(null);
-            appName = app0.path("app_name").asText(null);
-            zhimouAppImage = app0.path("image").asText(null);
-            JsonNode objectsNode = app0.path("objects");
-            totalHit = (objectsNode != null && objectsNode.isArray()) ? objectsNode.size() : 0;
-            // targets_json 保留 apps[] 完整原文 (排错/审计)
+            java.util.LinkedHashSet<String> idSet = new java.util.LinkedHashSet<>();
+            java.util.LinkedHashSet<String> nameSet = new java.util.LinkedHashSet<>();
+            int maxObj = -1;
+            for (JsonNode app : appsNode) {
+                JsonNode objectsNode = app.path("objects");
+                int cnt = (objectsNode != null && objectsNode.isArray()) ? objectsNode.size() : 0;
+                totalHit += cnt;
+                String aId = app.path("app_id").asText(null);
+                String aName = app.path("app_name").asText(null);
+                if (StrUtil.isNotBlank(aId)) idSet.add(aId);
+                if (StrUtil.isNotBlank(aName)) nameSet.add(aName);
+                String img = app.path("image").asText(null);
+                if (StrUtil.isNotBlank(img) && cnt > 0) hitAppImages.add(new String[]{img, aId, aName, String.valueOf(cnt)});
+                if (cnt > maxObj) { maxObj = cnt; zhimouAppImage = img; }
+            }
+            appId = String.join(",", idSet);
+            appName = String.join(",", nameSet);
+            // targets_json 保留 apps[] 完整原文 (排错/审计/回填)
             targetsJsonStr = appsNode.toString();
         }
 
         // 4.5 阶段2补充: 命中时下载知眸标注图 → 落盘到二期专用目录
         //     直接存知眸原始JPEG(不转PNG, 避免5.3K图无损膨胀到几十MB)
-        //     结构: {detectRootDir}/{yyyyMMdd}/{taskUuid}/annotated/{baseName}.jpg
+        //     多app全量落盘: 主图(目标最多)={baseName}.jpg, 其余={baseName}_{appId}.jpg
+        //     DB annotated_local_path 存逗号分隔多路径(主图第一, 供前端多图预览)
         //     失败只warn不阻塞入库(告警降级显示原图)
         String annotatedRelPath = null;
-        if (StrUtil.isNotBlank(zhimouAppImage) && totalHit > 0) {
+        java.util.List<String> annoRelPaths = new java.util.ArrayList<>();
+        if (!hitAppImages.isEmpty() && totalHit > 0) {
             try {
                 String baseUrl = properties.getOpenapi() != null ? StrUtil.trimToEmpty(properties.getOpenapi().getBaseUrl()) : "";
                 if (baseUrl.endsWith("/")) baseUrl = baseUrl.substring(0, baseUrl.length() - 1);
-                String fullUrl = zhimouAppImage.startsWith("/") ? baseUrl + zhimouAppImage
-                        : (zhimouAppImage.toLowerCase().startsWith("http") ? zhimouAppImage : baseUrl + "/" + zhimouAppImage);
-                byte[] annoBytes = cn.hutool.http.HttpUtil.downloadBytes(fullUrl);
-                if (annoBytes != null && annoBytes.length > 0) {
-                    String dayDir = java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd"));
-                    // taskUuid 优先取 zhimouTaskId; 文件名优先用 localImageName 的 baseName
-                    String dirUuid = StrUtil.isNotBlank(zhimouTaskId) ? zhimouTaskId : "unknown";
-                    String baseName = (StrUtil.isNotBlank(localImageName) && localImageName.contains("/"))
-                            ? localImageName.substring(localImageName.lastIndexOf('/') + 1)
-                            : (StrUtil.isNotBlank(localImageName) ? localImageName : "frame_" + frameId);
-                    int dotIdx = baseName.lastIndexOf('.');
-                    if (dotIdx > 0) baseName = baseName.substring(0, dotIdx);
-                    java.nio.file.Path annoDir = java.nio.file.Paths.get(detectRootDir, dayDir, dirUuid, "annotated");
-                    java.nio.file.Files.createDirectories(annoDir);
-                    java.nio.file.Path annoFile = annoDir.resolve(baseName + ".jpg");
-                    java.nio.file.Files.write(annoFile, annoBytes);
-                    annotatedRelPath = dayDir + "/" + dirUuid + "/annotated/" + baseName + ".jpg";
-                    log.info("[知眸-图片回调] 标注图落盘成功 relPath={} size={}", annotatedRelPath, annoBytes.length);
-                } else {
-                    log.warn("[知眸-图片回调] 标注图下载返回空 fullUrl={}", fullUrl);
+                String dayDir = java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd"));
+                // taskUuid 优先取 zhimouTaskId; 文件名优先用 localImageName 的 baseName
+                String dirUuid = StrUtil.isNotBlank(zhimouTaskId) ? zhimouTaskId : "unknown";
+                String baseName = (StrUtil.isNotBlank(localImageName) && localImageName.contains("/"))
+                        ? localImageName.substring(localImageName.lastIndexOf('/') + 1)
+                        : (StrUtil.isNotBlank(localImageName) ? localImageName : "frame_" + frameId);
+                int dotIdx = baseName.lastIndexOf('.');
+                if (dotIdx > 0) baseName = baseName.substring(0, dotIdx);
+                java.nio.file.Path annoDir = java.nio.file.Paths.get(detectRootDir, dayDir, dirUuid, "annotated");
+                java.nio.file.Files.createDirectories(annoDir);
+                for (String[] hitApp : hitAppImages) {
+                    try {
+                        String imgPath = hitApp[0];
+                        String aId = hitApp[1];
+                        boolean isMain = imgPath.equals(zhimouAppImage);
+                        String fullUrl = imgPath.startsWith("/") ? baseUrl + imgPath
+                                : (imgPath.toLowerCase().startsWith("http") ? imgPath : baseUrl + "/" + imgPath);
+                        byte[] annoBytes = cn.hutool.http.HttpUtil.downloadBytes(fullUrl);
+                        if (annoBytes == null || annoBytes.length == 0) {
+                            log.warn("[知眸-图片回调] 标注图下载返回空 fullUrl={}", fullUrl);
+                            continue;
+                        }
+                        String fileName = isMain ? baseName + ".jpg" : baseName + "_" + aId + ".jpg";
+                        java.nio.file.Files.write(annoDir.resolve(fileName), annoBytes);
+                        String relPath = dayDir + "/" + dirUuid + "/annotated/" + fileName;
+                        if (isMain) {
+                            annoRelPaths.add(0, relPath); // 主图排第一
+                            log.info("[知眸-图片回调] 主标注图落盘成功 relPath={} size={}", relPath, annoBytes.length);
+                        } else {
+                            annoRelPaths.add(relPath);
+                            log.info("[知眸-图片回调] 副标注图落盘成功 file={} size={}", fileName, annoBytes.length);
+                        }
+                    } catch (Exception ex) {
+                        log.warn("[知眸-图片回调] 标注图落盘异常(单张) img={}, err={}", hitApp[0], ex.getMessage());
+                    }
+                }
+                if (!annoRelPaths.isEmpty()) {
+                    annotatedRelPath = String.join(",", annoRelPaths);
                 }
             } catch (Exception annoEx) {
-                log.warn("[知眸-图片回调] 标注图落盘异常(不影响入库) appImage={}, err={}", zhimouAppImage, annoEx.getMessage());
+                log.warn("[知眸-图片回调] 标注图落盘异常(不影响入库) err={}", annoEx.getMessage());
             }
         }
 

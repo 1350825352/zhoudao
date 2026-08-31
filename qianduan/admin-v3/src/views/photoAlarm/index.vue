@@ -47,7 +47,14 @@
         <el-table-column prop="id" label="序号" width="80" />
         <el-table-column prop="rule_name" label="告警类型" min-width="120">
           <template #default="{ row }">
-            <span>{{ row.rule_name || '-' }}</span>
+            <el-tooltip
+              v-if="row.rule_name && row.rule_name.includes(',')"
+              :content="row.rule_name"
+              placement="top"
+            >
+              <span class="rule-name-cell">{{ formatRuleName(row.rule_name) }}</span>
+            </el-tooltip>
+            <span v-else>{{ row.rule_name || '-' }}</span>
           </template>
         </el-table-column>
         <el-table-column prop="hit_count" label="识别目标数" width="110">
@@ -163,6 +170,12 @@
           {{ currentIndex + 1 }} / {{ imageItems.length }}
         </div>
 
+        <div v-if="annoUrls.length > 1" class="anno-switcher" @click.stop>
+          <button class="anno-btn" :disabled="annoIdx <= 0" @click.stop="prevAnno">◀</button>
+          <span class="anno-label">标注图 {{ annoIdx + 1 }}/{{ annoUrls.length }}</span>
+          <button class="anno-btn" :disabled="annoIdx >= annoUrls.length - 1" @click.stop="nextAnno">▶</button>
+        </div>
+
         <button class="preview-close" @click="closePreview">✕</button>
 
         <button
@@ -203,6 +216,7 @@ interface AlarmData {
   longitude: number
   height: number
   image_http_url: string
+  annotated_urls?: string[]
   image_width: number
   image_height: number
   local_image_name: string
@@ -245,6 +259,9 @@ const previewImage = ref('')
 const previewItem = ref<AlarmData | null>(null)
 const currentIndex = ref(0)
 const imageItems = ref<AlarmData[]>([])
+// 多app标注图: 当前记录的标注图列表与索引(主图第一)
+const annoUrls = ref<string[]>([])
+const annoIdx = ref(0)
 
 const scale = ref(1)
 const translateX = ref(0)
@@ -351,9 +368,22 @@ const handlePreviewMark = async () => {
   }
 }
 
+// 告警类型列显示: 多类型截断为 "xx识别 等N类", 悬浮tooltip显示全称
+const formatRuleName = (name: string) => {
+  if (!name) return '-'
+  const parts = name.split(',').filter(Boolean)
+  return parts.length > 1 ? `${parts[0]} 等${parts.length}类` : name
+}
+
+const applyPreviewItem = (item: AlarmData) => {
+  previewItem.value = item
+  annoUrls.value = item.annotated_urls && item.annotated_urls.length ? item.annotated_urls : [item.image_http_url]
+  annoIdx.value = 0
+  previewImage.value = annoUrls.value[0]
+}
+
 const openImage = (row: AlarmData) => {
-  previewImage.value = row.image_http_url
-  previewItem.value = row
+  applyPreviewItem(row)
   currentIndex.value = imageItems.value.findIndex(item => item.id === row.id)
   scale.value = 1
   translateX.value = 0
@@ -370,9 +400,7 @@ const closePreview = () => {
 const prevImage = () => {
   if (currentIndex.value > 0) {
     currentIndex.value--
-    const item = imageItems.value[currentIndex.value]
-    previewImage.value = item.image_http_url
-    previewItem.value = item
+    applyPreviewItem(imageItems.value[currentIndex.value])
     resetZoom()
   }
 }
@@ -380,9 +408,24 @@ const prevImage = () => {
 const nextImage = () => {
   if (currentIndex.value < imageItems.value.length - 1) {
     currentIndex.value++
-    const item = imageItems.value[currentIndex.value]
-    previewImage.value = item.image_http_url
-    previewItem.value = item
+    applyPreviewItem(imageItems.value[currentIndex.value])
+    resetZoom()
+  }
+}
+
+// 记录内多app标注图切换
+const prevAnno = () => {
+  if (annoIdx.value > 0) {
+    annoIdx.value--
+    previewImage.value = annoUrls.value[annoIdx.value]
+    resetZoom()
+  }
+}
+
+const nextAnno = () => {
+  if (annoIdx.value < annoUrls.value.length - 1) {
+    annoIdx.value++
+    previewImage.value = annoUrls.value[annoIdx.value]
     resetZoom()
   }
 }
@@ -432,6 +475,7 @@ const handleMouseUp = () => {
 }
 
 onMounted(() => {
+  loadData()
   window.addEventListener('mousemove', handleMouseMove)
   window.addEventListener('mouseup', handleMouseUp)
 })
@@ -561,6 +605,38 @@ onUnmounted(() => {
   padding: 6px 14px;
   border-radius: 20px;
   font-size: 13px;
+}
+
+/* 多app标注图切换器: 顶部居中, 位于记录计数器下方 */
+.anno-switcher {
+  position: absolute;
+  top: 52px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(0, 0, 0, 0.6);
+  padding: 4px 10px;
+  border-radius: 16px;
+  z-index: 10;
+}
+.anno-btn {
+  background: transparent;
+  border: none;
+  color: #fff;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 4px;
+}
+.anno-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+.anno-label {
+  color: #fff;
+  font-size: 12px;
+  white-space: nowrap;
 }
 
 .preview-close {
