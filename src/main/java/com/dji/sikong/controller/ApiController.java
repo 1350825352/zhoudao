@@ -585,11 +585,12 @@ public class ApiController {
         DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
         if (imageMode) {
-            // 图片识别模式: 查 zhimou_image_detection 表, 只返回已清洗的
+            // 图片识别模式: 查 zhimou_image_detection 表, 只返回已清洗+命中的(与照片告警页口径一致)
             List<com.dji.sikong.entity.ZhimouImageDetection> imgResults = zhimouImageDetectionMapper.selectList(
                     new LambdaQueryWrapper<com.dji.sikong.entity.ZhimouImageDetection>()
                             .eq(com.dji.sikong.entity.ZhimouImageDetection::getDeleted, 0)
                             .ne(com.dji.sikong.entity.ZhimouImageDetection::getCleanStatus, 0)
+                            .gt(com.dji.sikong.entity.ZhimouImageDetection::getHitCount, 0)
                             .orderByDesc(com.dji.sikong.entity.ZhimouImageDetection::getEventTime)
                             .last("LIMIT 50")
             );
@@ -600,8 +601,14 @@ public class ApiController {
                 dto.setRuleName(r.getAppName() != null ? r.getAppName() : "未知规则");
                 dto.setAlarmTime(r.getEventTime() != null ? r.getEventTime().format(formatter) : "");
                 dto.setLevel("high");
-                if (r.getLocalImagePath() != null) {
-                    dto.setImageUrl("/api/zhimou-img/" + r.getLocalImagePath());
+                // 阶段2补充: 标注图优先(带框, 二期目录), 兜底原图; 一期手动入口数据仍走 /zhimou-img/
+                String annoPath = r.getAnnotatedLocalPath();
+                if (StrUtil.isNotBlank(annoPath)) {
+                    dto.setImageUrl("/api/image-detect-img/" + annoPath);
+                } else if (r.getLocalImagePath() != null) {
+                    String rel = r.getLocalImagePath();
+                    boolean phase2 = rel.split("/").length >= 3; // {date}/{taskUuid}/original/xx.jpg
+                    dto.setImageUrl(phase2 ? "/api/image-detect-img/" + rel : "/api/zhimou-img/" + rel);
                 }
                 if (r.getLongitude() != null) dto.setLng(r.getLongitude().doubleValue());
                 if (r.getLatitude() != null) dto.setLat(r.getLatitude().doubleValue());

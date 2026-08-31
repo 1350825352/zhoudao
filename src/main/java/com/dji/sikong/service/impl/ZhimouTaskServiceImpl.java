@@ -1499,8 +1499,9 @@ public class ZhimouTaskServiceImpl extends ServiceImpl<ZhimouTaskMapper, ZhimouT
             targetsJsonStr = appsNode.toString();
         }
 
-        // 4.5 阶段2补充: 命中时下载知眸标注图 → 转PNG → 落盘到二期专用目录
-        //     结构: {detectRootDir}/{yyyyMMdd}/{taskUuid}/annotated/{baseName}.png
+        // 4.5 阶段2补充: 命中时下载知眸标注图 → 落盘到二期专用目录
+        //     直接存知眸原始JPEG(不转PNG, 避免5.3K图无损膨胀到几十MB)
+        //     结构: {detectRootDir}/{yyyyMMdd}/{taskUuid}/annotated/{baseName}.jpg
         //     失败只warn不阻塞入库(告警降级显示原图)
         String annotatedRelPath = null;
         if (StrUtil.isNotBlank(zhimouAppImage) && totalHit > 0) {
@@ -1511,25 +1512,20 @@ public class ZhimouTaskServiceImpl extends ServiceImpl<ZhimouTaskMapper, ZhimouT
                         : (zhimouAppImage.toLowerCase().startsWith("http") ? zhimouAppImage : baseUrl + "/" + zhimouAppImage);
                 byte[] annoBytes = cn.hutool.http.HttpUtil.downloadBytes(fullUrl);
                 if (annoBytes != null && annoBytes.length > 0) {
-                    byte[] pngBytes = convertToPngBytes(annoBytes);
-                    if (pngBytes != null && pngBytes.length > 0) {
-                        String dayDir = java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd"));
-                        // taskUuid 优先取 zhimouTaskId; 文件名优先用 localImageName 的 baseName
-                        String dirUuid = StrUtil.isNotBlank(zhimouTaskId) ? zhimouTaskId : "unknown";
-                        String baseName = (StrUtil.isNotBlank(localImageName) && localImageName.contains("/"))
-                                ? localImageName.substring(localImageName.lastIndexOf('/') + 1)
-                                : (StrUtil.isNotBlank(localImageName) ? localImageName : "frame_" + frameId);
-                        int dotIdx = baseName.lastIndexOf('.');
-                        if (dotIdx > 0) baseName = baseName.substring(0, dotIdx);
-                        java.nio.file.Path annoDir = java.nio.file.Paths.get(detectRootDir, dayDir, dirUuid, "annotated");
-                        java.nio.file.Files.createDirectories(annoDir);
-                        java.nio.file.Path annoFile = annoDir.resolve(baseName + ".png");
-                        java.nio.file.Files.write(annoFile, pngBytes);
-                        annotatedRelPath = dayDir + "/" + dirUuid + "/annotated/" + baseName + ".png";
-                        log.info("[知眸-图片回调] 标注图落盘成功 relPath={} size={}", annotatedRelPath, pngBytes.length);
-                    } else {
-                        log.warn("[知眸-图片回调] 标注图转PNG失败, 告警将降级显示原图 appImage={}", fullUrl);
-                    }
+                    String dayDir = java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd"));
+                    // taskUuid 优先取 zhimouTaskId; 文件名优先用 localImageName 的 baseName
+                    String dirUuid = StrUtil.isNotBlank(zhimouTaskId) ? zhimouTaskId : "unknown";
+                    String baseName = (StrUtil.isNotBlank(localImageName) && localImageName.contains("/"))
+                            ? localImageName.substring(localImageName.lastIndexOf('/') + 1)
+                            : (StrUtil.isNotBlank(localImageName) ? localImageName : "frame_" + frameId);
+                    int dotIdx = baseName.lastIndexOf('.');
+                    if (dotIdx > 0) baseName = baseName.substring(0, dotIdx);
+                    java.nio.file.Path annoDir = java.nio.file.Paths.get(detectRootDir, dayDir, dirUuid, "annotated");
+                    java.nio.file.Files.createDirectories(annoDir);
+                    java.nio.file.Path annoFile = annoDir.resolve(baseName + ".jpg");
+                    java.nio.file.Files.write(annoFile, annoBytes);
+                    annotatedRelPath = dayDir + "/" + dirUuid + "/annotated/" + baseName + ".jpg";
+                    log.info("[知眸-图片回调] 标注图落盘成功 relPath={} size={}", annotatedRelPath, annoBytes.length);
                 } else {
                     log.warn("[知眸-图片回调] 标注图下载返回空 fullUrl={}", fullUrl);
                 }
@@ -2316,12 +2312,17 @@ public class ZhimouTaskServiceImpl extends ServiceImpl<ZhimouTaskMapper, ZhimouT
         for (File srcFile : imageFiles) {
             try {
                 // 2.1 落盘到 imageBaseDir/yyyyMMdd/{原文件名}
+                //     阶段2补充: MinIO入口(prefix非空)不写一期目录, 原图由自有模型侧落盘到
+                //     二期 original/ (同一来源同一文件), 避免二期文件混入一期目录
                 String dayDir = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd"));
-                Path targetDir = Paths.get(imageBaseDir, dayDir);
-                Files.createDirectories(targetDir);
-                Path targetPath = targetDir.resolve(srcFile.getName());
-                if (!targetPath.toFile().exists()) {
-                    Files.copy(srcFile.toPath(), targetPath, StandardCopyOption.REPLACE_EXISTING);
+                boolean minioEntry = StrUtil.isNotBlank(customLocalImagePrefix);
+                if (!minioEntry) {
+                    Path targetDir = Paths.get(imageBaseDir, dayDir);
+                    Files.createDirectories(targetDir);
+                    Path targetPath = targetDir.resolve(srcFile.getName());
+                    if (!targetPath.toFile().exists()) {
+                        Files.copy(srcFile.toPath(), targetPath, StandardCopyOption.REPLACE_EXISTING);
+                    }
                 }
 
                 // 2.2 构造 local_image_name
@@ -2339,10 +2340,13 @@ public class ZhimouTaskServiceImpl extends ServiceImpl<ZhimouTaskMapper, ZhimouT
                 BigDecimal lat = gps[0], lon = gps[1], alt = gps[2];
 
                 // 2.4 元数据存 Redis Hash, handleCallback 时用 (taskId, frame.id) 反查
+                //     MinIO入口的 local_image_path 指向二期 original/ (与大屏/告警兜底URL前缀 /image-detect-img/ 配套)
                 String metaKey = "zhimou:img:meta:" + taskId + ":" + imageId;
                 Map<String, String> meta = new LinkedHashMap<>();
                 meta.put("local_image_name", localImageName);
-                meta.put("local_image_path", dayDir + "/" + fileName);
+                meta.put("local_image_path", minioEntry
+                        ? dayDir + "/" + customLocalImagePrefix + "/original/" + fileName
+                        : dayDir + "/" + fileName);
                 meta.put("latitude", lat != null ? lat.toPlainString() : "");
                 meta.put("longitude", lon != null ? lon.toPlainString() : "");
                 meta.put("altitude", alt != null ? alt.toPlainString() : "");

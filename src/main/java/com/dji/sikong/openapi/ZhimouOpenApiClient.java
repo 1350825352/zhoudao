@@ -526,7 +526,8 @@ public class ZhimouOpenApiClient {
         StringBuilder url = new StringBuilder(buildUrl("/api/task/" + taskId + "/image"));
         url.append("?image_id=").append(imageId);
         if (StrUtil.isNotBlank(device)) url.append("&device_id=").append(device);
-        // enhance 默认0, 不传
+        // 图片增强识别: 高分辨率(>2K)图片小目标识别, 1=开启 (本期图片均为5.3K, 开启提升小目标检出率)
+        url.append("&enhance=1");
         try {
             Map<String, String> headers = buildHeaders();
             headers.put("Content-Type", "application/octet-stream");

@@ -421,10 +421,18 @@ public class ZhimouController {
         m.put("longitude", img.getLongitude());
         m.put("height", img.getAltitude());
         // 图片URL: 优先知眸标注图(带框, 已落盘), 无标注图时兜底原图
+        // 阶段2补充: 兜底路径按格式选前缀 - 二期({date}/{taskUuid}/original/xx)走 /image-detect-img/, 一期手动入口走 /zhimou-img/
         String annotated = img.getAnnotatedLocalPath();
         String imageRelPath = StrUtil.isNotBlank(annotated) ? annotated : img.getLocalImagePath();
-        // context-path=/api, 二期静态映射 /image-detect-img/** → /api/image-detect-img/...
-        m.put("image_http_url", StrUtil.isNotBlank(imageRelPath) ? "/api/image-detect-img/" + imageRelPath : "");
+        String urlPrefix;
+        if (StrUtil.isNotBlank(annotated)) {
+            urlPrefix = "/api/image-detect-img/";
+        } else if (StrUtil.isNotBlank(imageRelPath)) {
+            urlPrefix = imageRelPath.split("/").length >= 3 ? "/api/image-detect-img/" : "/api/zhimou-img/";
+        } else {
+            urlPrefix = null;
+        }
+        m.put("image_http_url", urlPrefix != null ? urlPrefix + imageRelPath : "");
         m.put("image_has_osd", img.getLatitude() != null ? 1 : 0);
         m.put("image_width", img.getImageWidth());
         m.put("image_height", img.getImageHeight());
