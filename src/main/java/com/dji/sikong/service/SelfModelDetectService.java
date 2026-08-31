@@ -9,6 +9,7 @@ import com.dji.sikong.service.impl.ZhimouTaskServiceImpl;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import javax.annotation.Resource;
@@ -44,6 +45,10 @@ public class SelfModelDetectService {
 
     @Resource
     private SelfModelImageDetectionMapper selfModelImageDetectionMapper;
+
+    /** 二期照片识别专用落盘根目录 (与一期视频 zhimou-images 物理解耦) */
+    @Value("${zhimou.image.detectRootDir:zhimou-image-detect}")
+    private String detectRootDir;
 
     @Resource
     private ZhimouTaskServiceImpl zhimouTaskService;
@@ -88,15 +93,26 @@ public class SelfModelDetectService {
             rec.setLocalImageName(localImageName);
             rec.setImageFormat(ext);
 
-            // 落盘到 imageBaseDir/yyyyMMdd/{原文件名}
+            // 落盘: 阶段3(照片识别, customLocalImageName带taskUuid前缀) → 二期专用目录(与一期视频目录解耦)
+            //       结构: {detectRootDir}/{yyyyMMdd}/{taskUuid}/original/{原文件名}
+            //       阶段2(手动测试) → 沿用 imageBaseDir/{yyyyMMdd}/
             String dayDir = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd"));
-            Path targetDir = Paths.get(imageBaseDir, dayDir);
+            Path targetDir;
+            String relPath;
+            if (StrUtil.isNotBlank(customLocalImageName) && customLocalImageName.contains("/")) {
+                String taskUuid = customLocalImageName.substring(0, customLocalImageName.indexOf('/'));
+                targetDir = Paths.get(detectRootDir, dayDir, taskUuid, "original");
+                relPath = dayDir + "/" + taskUuid + "/original/" + fileName;
+            } else {
+                targetDir = Paths.get(imageBaseDir, dayDir);
+                relPath = dayDir + "/" + fileName;
+            }
             Files.createDirectories(targetDir);
             Path targetPath = targetDir.resolve(fileName);
             if (!targetPath.toFile().exists()) {
                 Files.copy(imageFile.toPath(), targetPath, StandardCopyOption.REPLACE_EXISTING);
             }
-            rec.setLocalImagePath(dayDir + "/" + fileName);
+            rec.setLocalImagePath(relPath);
 
             // 提取 EXIF GPS
             BigDecimal[] gps = ImageExifUtil.extractGps(imageFile);

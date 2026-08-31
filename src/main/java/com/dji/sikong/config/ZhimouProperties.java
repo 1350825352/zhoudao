@@ -103,6 +103,12 @@ public class ZhimouProperties {
         private String saveRootDir = "H:/traeproject/ceshisikongapiAI/zhimou-images";
 
         /**
+         * 二期照片识别专用根目录(与一期视频目录物理隔离).
+         * 结构: {detectRootDir}/{yyyyMMdd}/{taskUuid}/original|annotated/
+         */
+        private String detectRootDir = "zhimou-image-detect";
+
+        /**
          * 静态资源URL前缀(配合WebMvcConfigurer静态映射).
          * 默认 /zhimou-img/ -> 最终前端访问 /api/zhimou-img/yyyyMMdd/xxx.png
          */

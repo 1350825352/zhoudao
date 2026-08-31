@@ -50,8 +50,8 @@
         <!-- 警情数据源切换 -->
         <div class="switch-item">
           <div class="switch-info">
-            <div class="switch-label">警情数据源</div>
-            <div class="switch-desc">全局切换警情信息显示的数据源。所有用户看到同样的数据源。</div>
+            <div class="switch-label">大屏警情数据源</div>
+            <div class="switch-desc">仅控制大屏警情模块的数据源；admin 的告警管理/照片告警页面不受影响。</div>
           </div>
           <el-radio-group
             v-model="alertDataSource"
@@ -75,7 +75,7 @@
       <ul class="info-list">
         <li><b>视频流任务开关</b>：关闭时立即关闭所有运行中的知眸视频任务，并停止自动创建新任务；开启后恢复自动调度。</li>
         <li><b>图片识别任务开关</b>：关闭时图片识别测试入口和 MinIO 事件接收接口都将忽略请求；开启后恢复识别流程。</li>
-        <li><b>警情数据源</b>：切换为"图片识别"后，前端警情列表只显示已清洗（clean_status != 0）的图片识别结果。</li>
+        <li><b>大屏警情数据源</b>：切换为"图片识别"后，大屏警情列表只显示已清洗（clean_status != 0）的图片识别结果；admin 的"告警管理"固定显示视频识别告警、"照片告警"固定显示图片识别告警，不随此开关变化。</li>
         <li>所有设置<b>全局生效</b>，screen-v3 大屏等所有用户看到的警情数据源与此处设置一致。</li>
       </ul>
     </el-card>
@@ -129,7 +129,7 @@ const onSwitchChange = async (key: string, value: string) => {
 const getLabel = (key: string) => {
   if (key === 'video_task') return '视频流任务开关'
   if (key === 'image_task') return '图片识别任务开关'
-  if (key === 'alert_data_source') return '警情数据源'
+  if (key === 'alert_data_source') return '大屏警情数据源'
   return key
 }
 

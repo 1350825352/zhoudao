@@ -68,6 +68,10 @@ public class ZhimouTaskServiceImpl extends ServiceImpl<ZhimouTaskMapper, ZhimouT
     @Resource
     private ZhimouProperties properties;
 
+    /** 二期照片识别专用落盘根目录 (与一期视频 zhimou-images 物理解耦) */
+    @org.springframework.beans.factory.annotation.Value("${zhimou.image.detectRootDir:zhimou-image-detect}")
+    private String detectRootDir;
+
     @Resource
     private ZhimouDetectionResultMapper detectionResultMapper;
 
@@ -1495,6 +1499,45 @@ public class ZhimouTaskServiceImpl extends ServiceImpl<ZhimouTaskMapper, ZhimouT
             targetsJsonStr = appsNode.toString();
         }
 
+        // 4.5 阶段2补充: 命中时下载知眸标注图 → 转PNG → 落盘到二期专用目录
+        //     结构: {detectRootDir}/{yyyyMMdd}/{taskUuid}/annotated/{baseName}.png
+        //     失败只warn不阻塞入库(告警降级显示原图)
+        String annotatedRelPath = null;
+        if (StrUtil.isNotBlank(zhimouAppImage) && totalHit > 0) {
+            try {
+                String baseUrl = properties.getOpenapi() != null ? StrUtil.trimToEmpty(properties.getOpenapi().getBaseUrl()) : "";
+                if (baseUrl.endsWith("/")) baseUrl = baseUrl.substring(0, baseUrl.length() - 1);
+                String fullUrl = zhimouAppImage.startsWith("/") ? baseUrl + zhimouAppImage
+                        : (zhimouAppImage.toLowerCase().startsWith("http") ? zhimouAppImage : baseUrl + "/" + zhimouAppImage);
+                byte[] annoBytes = cn.hutool.http.HttpUtil.downloadBytes(fullUrl);
+                if (annoBytes != null && annoBytes.length > 0) {
+                    byte[] pngBytes = convertToPngBytes(annoBytes);
+                    if (pngBytes != null && pngBytes.length > 0) {
+                        String dayDir = java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd"));
+                        // taskUuid 优先取 zhimouTaskId; 文件名优先用 localImageName 的 baseName
+                        String dirUuid = StrUtil.isNotBlank(zhimouTaskId) ? zhimouTaskId : "unknown";
+                        String baseName = (StrUtil.isNotBlank(localImageName) && localImageName.contains("/"))
+                                ? localImageName.substring(localImageName.lastIndexOf('/') + 1)
+                                : (StrUtil.isNotBlank(localImageName) ? localImageName : "frame_" + frameId);
+                        int dotIdx = baseName.lastIndexOf('.');
+                        if (dotIdx > 0) baseName = baseName.substring(0, dotIdx);
+                        java.nio.file.Path annoDir = java.nio.file.Paths.get(detectRootDir, dayDir, dirUuid, "annotated");
+                        java.nio.file.Files.createDirectories(annoDir);
+                        java.nio.file.Path annoFile = annoDir.resolve(baseName + ".png");
+                        java.nio.file.Files.write(annoFile, pngBytes);
+                        annotatedRelPath = dayDir + "/" + dirUuid + "/annotated/" + baseName + ".png";
+                        log.info("[知眸-图片回调] 标注图落盘成功 relPath={} size={}", annotatedRelPath, pngBytes.length);
+                    } else {
+                        log.warn("[知眸-图片回调] 标注图转PNG失败, 告警将降级显示原图 appImage={}", fullUrl);
+                    }
+                } else {
+                    log.warn("[知眸-图片回调] 标注图下载返回空 fullUrl={}", fullUrl);
+                }
+            } catch (Exception annoEx) {
+                log.warn("[知眸-图片回调] 标注图落盘异常(不影响入库) appImage={}, err={}", zhimouAppImage, annoEx.getMessage());
+            }
+        }
+
         // 5. 入库 zhimou_image_detection 表
         ZhimouImageDetection rec = new ZhimouImageDetection();
         rec.setZhimouTaskId(zhimouTaskId);
@@ -1506,6 +1549,7 @@ public class ZhimouTaskServiceImpl extends ServiceImpl<ZhimouTaskMapper, ZhimouT
         rec.setLocalImageName(localImageName);
         rec.setZhimouImagePath(zhimouImagePath);
         rec.setZhimouAppImage(zhimouAppImage);
+        rec.setAnnotatedLocalPath(annotatedRelPath);
         rec.setLocalImagePath(localImagePath);
         rec.setImageWidth(imageWidth);
         rec.setImageHeight(imageHeight);

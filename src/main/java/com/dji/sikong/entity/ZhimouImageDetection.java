@@ -55,6 +55,9 @@ public class ZhimouImageDetection implements Serializable {
     /** 知眸app叠加标注后图片路径 */
     private String zhimouAppImage;
 
+    /** 知眸标注图本地落盘相对路径(yyyyMMdd/{taskUuid}/annotated/xxx.png), 命中时才有值 */
+    private String annotatedLocalPath;
+
     /** 本地落盘的相对路径(年月日/文件名.png) */
     private String localImagePath;
 

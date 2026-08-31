@@ -49,5 +49,27 @@ public class ZhimouWebMvcConfig implements WebMvcConfigurer {
         } catch (Exception e) {
             log.error("[知眸-静态资源映射] 配置异常", e);
         }
+
+        // ================ 二期照片识别专用目录映射 ================
+        // /image-detect-img/** -> {detectRootDir}/ (结构: yyyyMMdd/{taskUuid}/original|annotated/xx.jpg)
+        try {
+            String detectRoot = properties.getImage().getDetectRootDir();
+            if (detectRoot != null && !detectRoot.trim().isEmpty()) {
+                String location = detectRoot.endsWith("/") || detectRoot.endsWith("\\") ? detectRoot : detectRoot + File.separator;
+                if (!location.toLowerCase().startsWith("file:")) {
+                    location = "file:" + location;
+                }
+                log.info("[知眸-静态资源] 映射 URL模式:/image-detect-img/**  ->  本地目录:{}", location);
+                registry.addResourceHandler("/image-detect-img/**").addResourceLocations(location);
+
+                File ddir = new File(detectRoot);
+                if (!ddir.exists()) {
+                    boolean ok = ddir.mkdirs();
+                    log.info("[知眸-静态资源] 二期目录不存在, 自动创建:{} -> {}", detectRoot, ok);
+                }
+            }
+        } catch (Exception e) {
+            log.error("[知眸-静态资源映射] 二期目录配置异常", e);
+        }
     }
 }

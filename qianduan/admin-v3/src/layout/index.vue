@@ -43,6 +43,10 @@
             <el-icon><Warning /></el-icon>
             <span>告警管理</span>
           </el-menu-item>
+          <el-menu-item index="/photo-alarm">
+            <el-icon><Camera /></el-icon>
+            <span>照片告警</span>
+          </el-menu-item>
           <el-menu-item index="/data-statistics">
             <el-icon><DataAnalysis /></el-icon>
             <span>数据统计</span>
@@ -91,6 +95,7 @@ import {
   Files,
   Connection,
   Warning,
+  Camera,
   DataAnalysis,
   Tickets,
   User,

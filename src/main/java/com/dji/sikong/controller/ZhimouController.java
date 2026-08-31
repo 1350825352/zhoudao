@@ -308,10 +308,8 @@ public class ZhimouController {
             @RequestParam(value = "end_time", required = false) String endTime,
             @RequestParam(value = "page", defaultValue = "1") int page,
             @RequestParam(value = "size", defaultValue = "20") int size) {
-        String ds = taskSwitchService.getAlertDataSource();
-        if ("image".equals(ds)) {
-            return R.ok(pageImageResults(aircraftSn, page, size));
-        }
+        // 阶段2补充: 告警管理页固定显示一期视频识别告警(与照片告警页解耦);
+        // alert_data_source 开关降级为"大屏警情数据源"专用, 不再影响本接口。
         Page<ZhimouDetectionResult> resultPage = zhimouTaskService.pageResults(aircraftSn, ruleId, ruleName, deviceName, routeName, status, startTime, endTime, page, size);
         List<Map<String, Object>> vo = new ArrayList<>();
         for (ZhimouDetectionResult dr : resultPage.getRecords()) {
@@ -323,6 +321,66 @@ public class ZhimouController {
         res.put("page", resultPage.getCurrent());
         res.put("size", resultPage.getSize());
         return R.ok(res);
+    }
+
+    /** 二期补充: 照片告警分页(固定查二期表, 只显示已清洗+命中的记录) */
+    @GetMapping("/image-results/page")
+    public R<Map<String, Object>> pageImageAlarmResults(
+            @RequestParam(value = "aircraft_sn", required = false) String aircraftSn,
+            @RequestParam(value = "rule_name", required = false) String ruleName,
+            @RequestParam(value = "status", required = false) String status,
+            @RequestParam(value = "start_time", required = false) String startTime,
+            @RequestParam(value = "end_time", required = false) String endTime,
+            @RequestParam(value = "page", defaultValue = "1") int page,
+            @RequestParam(value = "size", defaultValue = "20") int size) {
+        com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<com.dji.sikong.entity.ZhimouImageDetection> qw =
+                new com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<>();
+        qw.ne(com.dji.sikong.entity.ZhimouImageDetection::getCleanStatus, 0);
+        qw.gt(com.dji.sikong.entity.ZhimouImageDetection::getHitCount, 0);
+        if (StrUtil.isNotBlank(aircraftSn)) {
+            qw.eq(com.dji.sikong.entity.ZhimouImageDetection::getDeviceId, aircraftSn);
+        }
+        if (StrUtil.isNotBlank(ruleName)) {
+            qw.like(com.dji.sikong.entity.ZhimouImageDetection::getAppName, ruleName);
+        }
+        if ("handled".equalsIgnoreCase(status)) {
+            qw.isNotNull(com.dji.sikong.entity.ZhimouImageDetection::getWorkOrderId);
+        } else if ("unhandled".equalsIgnoreCase(status)) {
+            qw.isNull(com.dji.sikong.entity.ZhimouImageDetection::getWorkOrderId);
+        }
+        if (StrUtil.isNotBlank(startTime)) {
+            qw.ge(com.dji.sikong.entity.ZhimouImageDetection::getEventTime, startTime);
+        }
+        if (StrUtil.isNotBlank(endTime)) {
+            qw.le(com.dji.sikong.entity.ZhimouImageDetection::getEventTime, endTime);
+        }
+        qw.orderByDesc(com.dji.sikong.entity.ZhimouImageDetection::getEventTime);
+        Page<com.dji.sikong.entity.ZhimouImageDetection> p = new Page<>(page, size);
+        Page<com.dji.sikong.entity.ZhimouImageDetection> resultPage = zhimouImageDetectionMapper.selectPage(p, qw);
+        List<Map<String, Object>> vo = new ArrayList<>();
+        for (com.dji.sikong.entity.ZhimouImageDetection img : resultPage.getRecords()) {
+            vo.add(buildImageResultVO(img));
+        }
+        Map<String, Object> res = new LinkedHashMap<>();
+        res.put("list", vo);
+        res.put("total", resultPage.getTotal());
+        res.put("page", resultPage.getCurrent());
+        res.put("size", resultPage.getSize());
+        return R.ok(res);
+    }
+
+    /** 二期补充: 标记照片告警已处理(写work_order_id, 与一期语义一致) */
+    @PutMapping("/image-results/{id}/handle")
+    public R<Void> handleImageAlarm(@PathVariable("id") Long id) {
+        com.dji.sikong.entity.ZhimouImageDetection rec = zhimouImageDetectionMapper.selectById(id);
+        if (rec == null) {
+            return R.fail("记录不存在: " + id);
+        }
+        if (rec.getWorkOrderId() == null) {
+            rec.setWorkOrderId(System.currentTimeMillis());
+            zhimouImageDetectionMapper.updateById(rec);
+        }
+        return R.ok(null);
     }
 
     /** 二期新增: 图片识别分页查询(只返回已清洗的) */
@@ -362,15 +420,20 @@ public class ZhimouController {
         m.put("latitude", img.getLatitude());
         m.put("longitude", img.getLongitude());
         m.put("height", img.getAltitude());
-        // 图片URL: 优先使用本地保存的图片路径
-        m.put("image_http_url", zhimouTaskService.buildImageHttpUrl(img.getLocalImagePath()));
+        // 图片URL: 优先知眸标注图(带框, 已落盘), 无标注图时兜底原图
+        String annotated = img.getAnnotatedLocalPath();
+        String imageRelPath = StrUtil.isNotBlank(annotated) ? annotated : img.getLocalImagePath();
+        // context-path=/api, 二期静态映射 /image-detect-img/** → /api/image-detect-img/...
+        m.put("image_http_url", StrUtil.isNotBlank(imageRelPath) ? "/api/image-detect-img/" + imageRelPath : "");
         m.put("image_has_osd", img.getLatitude() != null ? 1 : 0);
         m.put("image_width", img.getImageWidth());
         m.put("image_height", img.getImageHeight());
         m.put("wayline_uuid", "");
-        m.put("work_order_id", null);
         m.put("local_image_name", img.getLocalImageName());
         m.put("clean_status", img.getCleanStatus());
+        m.put("work_order_id", img.getWorkOrderId());
+        m.put("status", img.getWorkOrderId() != null ? "handled" : "unhandled");
+        m.put("hit_count", img.getHitCount() != null ? img.getHitCount() : 0);
         m.put("data_source", "image");
         return m;
     }

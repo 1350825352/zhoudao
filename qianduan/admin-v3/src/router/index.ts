@@ -46,6 +46,12 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '告警管理', icon: 'Warning' }
       },
       {
+        path: 'photo-alarm',
+        name: 'PhotoAlarm',
+        component: () => import('@/views/photoAlarm/index.vue'),
+        meta: { title: '照片告警', icon: 'Camera' }
+      },
+      {
         path: 'data-statistics',
         name: 'DataStatistics',
         component: () => import('@/views/data-statistics/index.vue'),
