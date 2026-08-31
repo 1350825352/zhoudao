@@ -103,9 +103,7 @@ public class ImageCleanupService {
             return result;
         }
 
-        // 3. 提取两侧目标中心点
-        //    知眸: 一结果一行模型, 同一图可能有多行(每app一行) → 合并该图所有行的 targets_json 目标
-        //    自有模型: 一图一行, 取最新有效行
+        // 3. 按行独立清洗 (一结果一行模型: 每行一个识别app, 与自有模型全量目标逐张对比, 各自独立判定)
         SelfModelImageDetection sLatest = sRecs.stream()
                 .filter(s -> s.getCallStatus() != null && s.getCallStatus() == 1 && s.getHitCount() != null && s.getHitCount() > 0)
                 .findFirst().orElse(null);
@@ -114,54 +112,65 @@ public class ImageCleanupService {
             log.warn("[清洗] {} localImageName={}", result, localImageName);
             return result;
         }
-
-        List<double[]> zCenters = new ArrayList<>();
-        for (ZhimouImageDetection z : zRecs) {
-            if (z.getHitCount() != null && z.getHitCount() > 0 && StrUtil.isNotBlank(z.getTargetsJson())) {
-                zCenters.addAll(extractZhimouCenters(z.getTargetsJson()));
-            }
-        }
         List<double[]> sCenters = extractSelfModelCenters(sLatest.getTargetsJson());
-        log.info("[清洗] localImageName={}, 知眸行数={}, 知眸目标数={}, 自有目标数={}",
-                localImageName,
-                zRecs.stream().filter(z -> z.getHitCount() != null && z.getHitCount() > 0).count(),
-                zCenters.size(), sCenters.size());
+        long zHitRows = zRecs.stream().filter(z -> z.getHitCount() != null && z.getHitCount() > 0).count();
+        log.info("[清洗] localImageName={}, 知眸命中行数={}, 自有目标数={}",
+                localImageName, zHitRows, sCenters.size());
 
-        // 4. 逐个知眸目标, 找自有模型中最近的目标, 判断是否匹配
-        int matchedZ = 0;
-        for (double[] zc : zCenters) {
-            double bestDist = Double.MAX_VALUE;
-            for (double[] sc : sCenters) {
-                double dist = Math.sqrt(
-                        Math.pow(zc[0] - sc[0], 2) + Math.pow(zc[1] - sc[1], 2));
-                if (dist < bestDist) bestDist = dist;
+        // 逐行知眸识别结果, 每张独立和自有模型所有框对比, 各行单独写clean_status
+        int hitRowCount = 0;
+        int anyAlarm = 0;
+        for (ZhimouImageDetection z : zRecs) {
+            if (z.getHitCount() == null || z.getHitCount() <= 0) continue;
+            hitRowCount++;
+            List<double[]> zCenters = extractZhimouCenters(z.getTargetsJson());
+            int zt = zCenters.size();
+            int matched = 0;
+            for (double[] zc : zCenters) {
+                double best = Double.MAX_VALUE;
+                for (double[] sc : sCenters) {
+                    double d = Math.hypot(zc[0] - sc[0], zc[1] - sc[1]);
+                    if (d < best) best = d;
+                }
+                if (best < distanceThreshold) matched++;
             }
-            if (bestDist < distanceThreshold) {
-                matchedZ++;
-                log.info("[清洗] 知眸目标({},{}) 与自有模型最近目标距离={} < {} → 匹配",
-                        zc[0], zc[1], String.format("%.2f", bestDist), distanceThreshold);
+            boolean fullMatch = matched > 0 && matched == zt;
+            boolean bulkMatch = matched >= 5 && matched * 2 >= zt; // ≥50%
+            int cs; String rm;
+            if (zt == 0) {
+                cs = 1; rm = "正常(该行无有效目标, 保留告警)";
+            } else if (fullMatch || bulkMatch) {
+                cs = 2;
+                if (fullMatch) rm = String.format("误识别:知眸%d个目标全部匹配自有模型", matched);
+                else rm = String.format("误识别:知眸%d个目标匹配%d个,匹配率%.0f%%达阈值",
+                        zt, matched, matched * 100.0 / zt);
             } else {
-                log.info("[清洗] 知眸目标({},{}) 最近距离={} >= {} → 不匹配",
-                        zc[0], zc[1], String.format("%.2f", bestDist), distanceThreshold);
+                cs = 1;
+                rm = String.format("正常:知眸%d个目标中%d个匹配自有模型", zt, matched);
+                anyAlarm++;
             }
+            z.setCleanStatus(cs);
+            z.setCleanRemark(rm);
+            z.setCleanTime(LocalDateTime.now());
+            zhimouImageDetectionMapper.updateById(z);
+            log.info("[清洗]   行id={} app={} zTargets={} matched={} → clean={}",
+                    z.getId(), z.getAppName(), zt, matched, cs);
         }
 
-        // 5. 综合判定: 所有知眸目标都有匹配的自有模型目标 → 误识别; 否则正常
-        String result;
-        int cleanStatus;
-        if (matchedZ > 0 && matchedZ == zCenters.size()) {
-            // 情况 A: 两边都有结果且全部目标匹配 → 误识别
-            result = String.format("误识别(知眸%d个目标全部匹配自有模型)", matchedZ);
-            cleanStatus = 2;
-        } else {
-            // 部分匹配 → 正常
-            result = String.format("正常(知眸%d个目标中%d个匹配自有模型)", zCenters.size(), matchedZ);
-            cleanStatus = 1;
+        // 自有模型行 (最坏情况: 任知眸一行保留告警 → 自有行同样保留)
+        int sClean = (anyAlarm > 0 || hitRowCount == 0) ? 1 : 2;
+        String sRemark = hitRowCount == 0 ? "正常(知眸本图无命中行, 保留告警)"
+                : (sClean == 2 ? String.format("误识别:知眸%d行全部判误识别(无保留告警)", hitRowCount)
+                               : String.format("正常:本图有%d行知眸识别结果保留告警", anyAlarm));
+        for (SelfModelImageDetection s : sRecs) {
+            s.setCleanStatus(sClean);
+            s.setCleanTime(LocalDateTime.now());
+            s.setCleanRemark(sRemark);
+            selfModelImageDetectionMapper.updateById(s);
         }
-        markCleanStatus(zRecs, sRecs, cleanStatus, result);
-        log.info("[清洗] 完成 localImageName={}, 结果={}, cleanStatus={}",
-                localImageName, result, cleanStatus);
-        return result;
+        String finalResult = String.format("逐行清洗完成: %d行知眸命中, %d行保留告警, 自有行clean=%d", hitRowCount, anyAlarm, sClean);
+        log.info("[清洗] 完成 localImageName={}, {}", localImageName, finalResult);
+        return finalResult;
     }
 
     /**
@@ -338,7 +347,7 @@ public class ImageCleanupService {
     }
 
     /**
-     * 批量更新两表的 clean_status
+     * 批量更新两表的 clean_status (保留给 B/C 分支使用: 某侧完全无结果时整体写同一个状态)
      */
     private void markCleanStatus(List<ZhimouImageDetection> zRecs, List<SelfModelImageDetection> sRecs,
                                  int cleanStatus, String remark) {

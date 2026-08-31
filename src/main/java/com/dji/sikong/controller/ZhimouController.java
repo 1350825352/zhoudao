@@ -279,7 +279,7 @@ public class ZhimouController {
     private List<Map<String, Object>> latestImageResults(String aircraftSn, int limit) {
         com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<com.dji.sikong.entity.ZhimouImageDetection> qw =
                 new com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<>();
-        qw.ne(com.dji.sikong.entity.ZhimouImageDetection::getCleanStatus, 0);
+        qw.eq(com.dji.sikong.entity.ZhimouImageDetection::getCleanStatus, 1); // 只显示clean=1(正常=真实告警), clean=2(误识别)隐藏
         if (StrUtil.isNotBlank(aircraftSn)) {
             qw.eq(com.dji.sikong.entity.ZhimouImageDetection::getDeviceId, aircraftSn);
         }
@@ -335,7 +335,7 @@ public class ZhimouController {
             @RequestParam(value = "size", defaultValue = "20") int size) {
         com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<com.dji.sikong.entity.ZhimouImageDetection> qw =
                 new com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<>();
-        qw.ne(com.dji.sikong.entity.ZhimouImageDetection::getCleanStatus, 0);
+        qw.eq(com.dji.sikong.entity.ZhimouImageDetection::getCleanStatus, 1); // 只显示真实告警, clean=2(误识别)隐藏
         qw.gt(com.dji.sikong.entity.ZhimouImageDetection::getHitCount, 0);
         if (StrUtil.isNotBlank(aircraftSn)) {
             qw.eq(com.dji.sikong.entity.ZhimouImageDetection::getDeviceId, aircraftSn);
@@ -387,7 +387,7 @@ public class ZhimouController {
     private Map<String, Object> pageImageResults(String aircraftSn, int page, int size) {
         com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<com.dji.sikong.entity.ZhimouImageDetection> qw =
                 new com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<>();
-        qw.ne(com.dji.sikong.entity.ZhimouImageDetection::getCleanStatus, 0);
+        qw.eq(com.dji.sikong.entity.ZhimouImageDetection::getCleanStatus, 1); // 只显示真实告警, clean=2(误识别)隐藏
         if (StrUtil.isNotBlank(aircraftSn)) {
             qw.eq(com.dji.sikong.entity.ZhimouImageDetection::getDeviceId, aircraftSn);
         }

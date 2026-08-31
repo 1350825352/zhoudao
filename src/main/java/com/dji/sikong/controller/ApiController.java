@@ -589,7 +589,7 @@ public class ApiController {
             List<com.dji.sikong.entity.ZhimouImageDetection> imgResults = zhimouImageDetectionMapper.selectList(
                     new LambdaQueryWrapper<com.dji.sikong.entity.ZhimouImageDetection>()
                             .eq(com.dji.sikong.entity.ZhimouImageDetection::getDeleted, 0)
-                            .ne(com.dji.sikong.entity.ZhimouImageDetection::getCleanStatus, 0)
+                            .eq(com.dji.sikong.entity.ZhimouImageDetection::getCleanStatus, 1) // 只显示真实告警, clean=2(误识别)隐藏
                             .gt(com.dji.sikong.entity.ZhimouImageDetection::getHitCount, 0)
                             .orderByDesc(com.dji.sikong.entity.ZhimouImageDetection::getEventTime)
                             .last("LIMIT 50")
