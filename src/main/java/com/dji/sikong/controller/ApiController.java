@@ -602,11 +602,10 @@ public class ApiController {
                 dto.setAlarmTime(r.getEventTime() != null ? r.getEventTime().format(formatter) : "");
                 dto.setLevel("high");
                 // 阶段2补充: 标注图优先(带框, 二期目录), 兜底原图; 一期手动入口数据仍走 /zhimou-img/
-                // 多app: annotated_local_path 逗号分隔多路径, 大屏显示主图(第一张)
+                // 一结果一行: annotated_local_path 为该行app自己的单路径
                 String annoPath = r.getAnnotatedLocalPath();
-                String mainAnno = StrUtil.isNotBlank(annoPath) ? annoPath.split(",")[0] : null;
-                if (StrUtil.isNotBlank(mainAnno)) {
-                    dto.setImageUrl("/api/image-detect-img/" + mainAnno);
+                if (StrUtil.isNotBlank(annoPath)) {
+                    dto.setImageUrl("/api/image-detect-img/" + annoPath);
                 } else if (r.getLocalImagePath() != null) {
                     String rel = r.getLocalImagePath();
                     boolean phase2 = rel.split("/").length >= 3; // {date}/{taskUuid}/original/xx.jpg

@@ -1092,7 +1092,9 @@ public class ZhimouTaskServiceImpl extends ServiceImpl<ZhimouTaskMapper, ZhimouT
     @Override
     public ZhimouDetectionResult handleCallback(JsonNode root) {
         if (root == null) return null;
-        String rawJson = JSONUtil.toJsonStr(root);
+        // 修复: hutool JSONUtil 对 Jackson JsonNode 序列化会丢失所有键名(只剩嵌套值数组)
+        // 必须用 Jackson 原生 toString(), 否则 raw_callback_json 审计数据损坏
+        String rawJson = root.toString();
         log.info("[知眸-回调] 收到消息: {}", rawJson);
 
         // ============================================================
@@ -1482,47 +1484,34 @@ public class ZhimouTaskServiceImpl extends ServiceImpl<ZhimouTaskMapper, ZhimouT
         Long frameIdBox = frameId >= 0 ? frameId : null;
         Integer frameEnhance = frameNode.has("enhance") && frameNode.path("enhance").isNumber() ? frameNode.get("enhance").asInt() : null;
 
-        // 4. 解析 apps[] → appId, appName, zhimouAppImage, targetsJson, totalHit
+        // 4. 解析 apps[] → 每个命中app独立一行入库 (一结果一行)
+        //    知眸一次回调可能含多个应用包结果(如汽车+人), 每个app一条告警记录,
+        //    每行挂自己的标注图, hit=该类目标数 (与知眸平台"识别结果数"口径一致)
         JsonNode appsNode = root.path("data").path("apps");
         int totalHit = 0;
-        String targetsJsonStr = null;
-        String appId = null, appName = null, zhimouAppImage = null;
         String zapkId = root.path("zapk_id").asText(null);
-        // 修复: 一张图可能命中多个应用包(如汽车+人), 遍历全部 apps[] 合并结果
-        //   - totalHit: 所有 app 的 objects 累计
-        //   - appId/appName: 去重拼接(逗号分隔)
-        //   - 主标注图: 目标数最多的 app (与落盘逻辑配合, 其余 app 标注图也全量落盘)
-        java.util.List<String[]> hitAppImages = new java.util.ArrayList<>(); // [image, appId, appName, objCount]
+        // hitApp: [0]=image [1]=appId [2]=appName [3]=objCount [4]=app原始JSON
+        java.util.List<String[]> hitApps = new java.util.ArrayList<>();
         if (appsNode.isArray() && appsNode.size() > 0) {
-            java.util.LinkedHashSet<String> idSet = new java.util.LinkedHashSet<>();
-            java.util.LinkedHashSet<String> nameSet = new java.util.LinkedHashSet<>();
-            int maxObj = -1;
             for (JsonNode app : appsNode) {
                 JsonNode objectsNode = app.path("objects");
                 int cnt = (objectsNode != null && objectsNode.isArray()) ? objectsNode.size() : 0;
                 totalHit += cnt;
                 String aId = app.path("app_id").asText(null);
-                String aName = app.path("app_name").asText(null);
-                if (StrUtil.isNotBlank(aId)) idSet.add(aId);
-                if (StrUtil.isNotBlank(aName)) nameSet.add(aName);
-                String img = app.path("image").asText(null);
-                if (StrUtil.isNotBlank(img) && cnt > 0) hitAppImages.add(new String[]{img, aId, aName, String.valueOf(cnt)});
-                if (cnt > maxObj) { maxObj = cnt; zhimouAppImage = img; }
+                if (cnt > 0 && StrUtil.isNotBlank(aId)) {
+                    hitApps.add(new String[]{
+                            app.path("image").asText(null), aId,
+                            app.path("app_name").asText(null),
+                            String.valueOf(cnt), app.toString()});
+                }
             }
-            appId = String.join(",", idSet);
-            appName = String.join(",", nameSet);
-            // targets_json 保留 apps[] 完整原文 (排错/审计/回填)
-            targetsJsonStr = appsNode.toString();
         }
 
-        // 4.5 阶段2补充: 命中时下载知眸标注图 → 落盘到二期专用目录
+        // 4.5 阶段2补充: 命中时逐app下载知眸标注图 → 每行挂自己的单路径
         //     直接存知眸原始JPEG(不转PNG, 避免5.3K图无损膨胀到几十MB)
-        //     多app全量落盘: 主图(目标最多)={baseName}.jpg, 其余={baseName}_{appId}.jpg
-        //     DB annotated_local_path 存逗号分隔多路径(主图第一, 供前端多图预览)
-        //     失败只warn不阻塞入库(告警降级显示原图)
-        String annotatedRelPath = null;
-        java.util.List<String> annoRelPaths = new java.util.ArrayList<>();
-        if (!hitAppImages.isEmpty() && totalHit > 0) {
+        //     文件名 {baseName}_{appId}.jpg; 单个app下载失败不影响其他app(该行降级显示原图)
+        java.util.Map<String, String> annoPathByApp = new java.util.LinkedHashMap<>();
+        if (!hitApps.isEmpty()) {
             try {
                 String baseUrl = properties.getOpenapi() != null ? StrUtil.trimToEmpty(properties.getOpenapi().getBaseUrl()) : "";
                 if (baseUrl.endsWith("/")) baseUrl = baseUrl.substring(0, baseUrl.length() - 1);
@@ -1536,73 +1525,99 @@ public class ZhimouTaskServiceImpl extends ServiceImpl<ZhimouTaskMapper, ZhimouT
                 if (dotIdx > 0) baseName = baseName.substring(0, dotIdx);
                 java.nio.file.Path annoDir = java.nio.file.Paths.get(detectRootDir, dayDir, dirUuid, "annotated");
                 java.nio.file.Files.createDirectories(annoDir);
-                for (String[] hitApp : hitAppImages) {
+                for (String[] hitApp : hitApps) {
+                    String imgPath = hitApp[0];
+                    String aId = hitApp[1];
+                    if (StrUtil.isBlank(imgPath)) continue;
                     try {
-                        String imgPath = hitApp[0];
-                        String aId = hitApp[1];
-                        boolean isMain = imgPath.equals(zhimouAppImage);
                         String fullUrl = imgPath.startsWith("/") ? baseUrl + imgPath
                                 : (imgPath.toLowerCase().startsWith("http") ? imgPath : baseUrl + "/" + imgPath);
                         byte[] annoBytes = cn.hutool.http.HttpUtil.downloadBytes(fullUrl);
                         if (annoBytes == null || annoBytes.length == 0) {
-                            log.warn("[知眸-图片回调] 标注图下载返回空 fullUrl={}", fullUrl);
+                            log.warn("[知眸-图片回调] 标注图下载返回空 appId={} fullUrl={}", aId, fullUrl);
                             continue;
                         }
-                        String fileName = isMain ? baseName + ".jpg" : baseName + "_" + aId + ".jpg";
+                        String fileName = baseName + "_" + aId + ".jpg";
                         java.nio.file.Files.write(annoDir.resolve(fileName), annoBytes);
                         String relPath = dayDir + "/" + dirUuid + "/annotated/" + fileName;
-                        if (isMain) {
-                            annoRelPaths.add(0, relPath); // 主图排第一
-                            log.info("[知眸-图片回调] 主标注图落盘成功 relPath={} size={}", relPath, annoBytes.length);
-                        } else {
-                            annoRelPaths.add(relPath);
-                            log.info("[知眸-图片回调] 副标注图落盘成功 file={} size={}", fileName, annoBytes.length);
-                        }
+                        annoPathByApp.put(aId, relPath);
+                        log.info("[知眸-图片回调] 标注图落盘成功 appId={} relPath={} size={}", aId, relPath, annoBytes.length);
                     } catch (Exception ex) {
-                        log.warn("[知眸-图片回调] 标注图落盘异常(单张) img={}, err={}", hitApp[0], ex.getMessage());
+                        log.warn("[知眸-图片回调] 标注图落盘异常(单app) appId={}, err={}", aId, ex.getMessage());
                     }
-                }
-                if (!annoRelPaths.isEmpty()) {
-                    annotatedRelPath = String.join(",", annoRelPaths);
                 }
             } catch (Exception annoEx) {
                 log.warn("[知眸-图片回调] 标注图落盘异常(不影响入库) err={}", annoEx.getMessage());
             }
         }
 
-        // 5. 入库 zhimou_image_detection 表
-        ZhimouImageDetection rec = new ZhimouImageDetection();
-        rec.setZhimouTaskId(zhimouTaskId);
-        rec.setBusinessId(businessId);
-        rec.setZapkId(zapkId);
-        rec.setAppId(appId);
-        rec.setAppName(appName);
-        rec.setDeviceId(device);
-        rec.setLocalImageName(localImageName);
-        rec.setZhimouImagePath(zhimouImagePath);
-        rec.setZhimouAppImage(zhimouAppImage);
-        rec.setAnnotatedLocalPath(annotatedRelPath);
-        rec.setLocalImagePath(localImagePath);
-        rec.setImageWidth(imageWidth);
-        rec.setImageHeight(imageHeight);
-        rec.setFrameId(frameIdBox);
-        rec.setFrameEnhance(frameEnhance);
-        rec.setLatitude(lat);
-        rec.setLongitude(lon);
-        rec.setAltitude(alt);
-        rec.setHitCount(totalHit);
-        if (targetsJsonStr != null) rec.setTargetsJson(targetsJsonStr);
-        rec.setEventTimestampMs(eventTs);
-        rec.setEventTime(LocalDateTime.ofInstant(Instant.ofEpochMilli(eventTs), ZoneId.systemDefault()));
-        rec.setRawCallbackJson(rawJson);
-        rec.setCallbackEvent(root.path("event").asText(null));
-        rec.setCleanStatus(0); // 0=未清洗
-        zhimouImageDetectionMapper.insert(rec);
-        log.info("[知眸-图片回调] 入库成功 id={}, taskId={}, frameId={}, localImageName={}, hit={}, gps=({},{},{})",
-                rec.getId(), zhimouTaskId, frameIdBox, localImageName, totalHit,
-                lat != null ? lat.toPlainString() : "N/A",
-                lon != null ? lon.toPlainString() : "N/A",
-                alt != null ? alt.toPlainString() : "N/A");
+        // 5. 入库 zhimou_image_detection 表: 一结果一行
+        //    命中时每个app插一行(hit=该类目标数, targets_json=该app单元素数组); 无命中插1行(hit=0, 保留审计原文)
+        String baseTargetsJson = (appsNode != null && appsNode.isArray() && appsNode.size() > 0) ? appsNode.toString() : null;
+        LocalDateTime eventLdt = LocalDateTime.ofInstant(Instant.ofEpochMilli(eventTs), ZoneId.systemDefault());
+        if (!hitApps.isEmpty()) {
+            for (String[] hitApp : hitApps) {
+                ZhimouImageDetection rec = new ZhimouImageDetection();
+                rec.setZhimouTaskId(zhimouTaskId);
+                rec.setBusinessId(businessId);
+                rec.setZapkId(zapkId);
+                rec.setAppId(hitApp[1]);
+                rec.setAppName(hitApp[2]);
+                rec.setDeviceId(device);
+                rec.setLocalImageName(localImageName);
+                rec.setZhimouImagePath(zhimouImagePath);
+                rec.setZhimouAppImage(hitApp[0]);
+                rec.setAnnotatedLocalPath(annoPathByApp.get(hitApp[1]));
+                rec.setLocalImagePath(localImagePath);
+                rec.setImageWidth(imageWidth);
+                rec.setImageHeight(imageHeight);
+                rec.setFrameId(frameIdBox);
+                rec.setFrameEnhance(frameEnhance);
+                rec.setLatitude(lat);
+                rec.setLongitude(lon);
+                rec.setAltitude(alt);
+                rec.setHitCount(Integer.parseInt(hitApp[3]));
+                // targets_json 存该app的单元素数组, 清洗侧合并各行即等价于全量apps
+                rec.setTargetsJson("[" + hitApp[4] + "]");
+                rec.setEventTimestampMs(eventTs);
+                rec.setEventTime(eventLdt);
+                rec.setRawCallbackJson(rawJson);
+                rec.setCallbackEvent(root.path("event").asText(null));
+                rec.setCleanStatus(0); // 0=未清洗
+                zhimouImageDetectionMapper.insert(rec);
+                log.info("[知眸-图片回调] 入库成功(一结果一行) id={}, taskId={}, app={}, hit={}, localImageName={}, annotated={}",
+                        rec.getId(), zhimouTaskId, hitApp[2], hitApp[3], localImageName, rec.getAnnotatedLocalPath());
+            }
+        } else {
+            ZhimouImageDetection rec = new ZhimouImageDetection();
+            rec.setZhimouTaskId(zhimouTaskId);
+            rec.setBusinessId(businessId);
+            rec.setZapkId(zapkId);
+            rec.setDeviceId(device);
+            rec.setLocalImageName(localImageName);
+            rec.setZhimouImagePath(zhimouImagePath);
+            rec.setLocalImagePath(localImagePath);
+            rec.setImageWidth(imageWidth);
+            rec.setImageHeight(imageHeight);
+            rec.setFrameId(frameIdBox);
+            rec.setFrameEnhance(frameEnhance);
+            rec.setLatitude(lat);
+            rec.setLongitude(lon);
+            rec.setAltitude(alt);
+            rec.setHitCount(0);
+            rec.setTargetsJson(baseTargetsJson);
+            rec.setEventTimestampMs(eventTs);
+            rec.setEventTime(eventLdt);
+            rec.setRawCallbackJson(rawJson);
+            rec.setCallbackEvent(root.path("event").asText(null));
+            rec.setCleanStatus(0); // 0=未清洗
+            zhimouImageDetectionMapper.insert(rec);
+            log.info("[知眸-图片回调] 入库成功(未命中) id={}, taskId={}, localImageName={}, gps=({},{},{})",
+                    rec.getId(), zhimouTaskId, localImageName,
+                    lat != null ? lat.toPlainString() : "N/A",
+                    lon != null ? lon.toPlainString() : "N/A",
+                    alt != null ? alt.toPlainString() : "N/A");
+        }
 
         // 6. 阶段3: 写入图片级 Redis 状态 + 自动触发数据清洗 (替换二期任务9 TODO)
         triggerImageCleanupIfReady(localImageName);

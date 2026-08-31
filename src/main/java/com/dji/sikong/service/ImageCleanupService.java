@@ -103,23 +103,29 @@ public class ImageCleanupService {
             return result;
         }
 
-        // 3. 提取两侧最新一条有效记录的目标中心点
-        ZhimouImageDetection zLatest = zRecs.stream()
-                .filter(z -> z.getHitCount() != null && z.getHitCount() > 0)
-                .findFirst().orElse(null);
+        // 3. 提取两侧目标中心点
+        //    知眸: 一结果一行模型, 同一图可能有多行(每app一行) → 合并该图所有行的 targets_json 目标
+        //    自有模型: 一图一行, 取最新有效行
         SelfModelImageDetection sLatest = sRecs.stream()
                 .filter(s -> s.getCallStatus() != null && s.getCallStatus() == 1 && s.getHitCount() != null && s.getHitCount() > 0)
                 .findFirst().orElse(null);
-        if (zLatest == null || sLatest == null) {
+        if (sLatest == null) {
             String result = "未找到有效记录, 跳过";
             log.warn("[清洗] {} localImageName={}", result, localImageName);
             return result;
         }
 
-        List<double[]> zCenters = extractZhimouCenters(zLatest.getTargetsJson());
+        List<double[]> zCenters = new ArrayList<>();
+        for (ZhimouImageDetection z : zRecs) {
+            if (z.getHitCount() != null && z.getHitCount() > 0 && StrUtil.isNotBlank(z.getTargetsJson())) {
+                zCenters.addAll(extractZhimouCenters(z.getTargetsJson()));
+            }
+        }
         List<double[]> sCenters = extractSelfModelCenters(sLatest.getTargetsJson());
-        log.info("[清洗] localImageName={}, 知眸目标数={}, 自有目标数={}",
-                localImageName, zCenters.size(), sCenters.size());
+        log.info("[清洗] localImageName={}, 知眸行数={}, 知眸目标数={}, 自有目标数={}",
+                localImageName,
+                zRecs.stream().filter(z -> z.getHitCount() != null && z.getHitCount() > 0).count(),
+                zCenters.size(), sCenters.size());
 
         // 4. 逐个知眸目标, 找自有模型中最近的目标, 判断是否匹配
         int matchedZ = 0;
