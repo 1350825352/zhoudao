@@ -102,8 +102,10 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import viewTitle from './-title.vue'
 import warningIcon from './img/dangerIcon.png'
 import { deviceApi } from '@/api/uav'
+import { useAppStore } from '@/store'
 
 const emit = defineEmits(['point'])
+const store = useAppStore()
 
 interface DangerRow {
   id: string
@@ -243,9 +245,17 @@ const handleMouseUp = () => {
   window.removeEventListener('mouseup', handleMouseUp)
 }
 
+// 飞行判定与地图一致: modeCode 非0且非14, 飞行时1秒轮询, 待机停止
+const isUavFlying = () =>
+  store.devices.some(d => d.kind === 'uav' && d.modeCode != null && d.modeCode !== 0 && d.modeCode !== 14)
+
+const pollAlerts = () => {
+  if (isUavFlying()) loadAlerts()
+}
+
 onMounted(() => {
   loadAlerts()
-  refreshTimer = setInterval(loadAlerts, 2000)
+  refreshTimer = setInterval(pollAlerts, 1000)
 })
 
 onUnmounted(() => {

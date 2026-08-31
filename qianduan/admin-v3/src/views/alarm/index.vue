@@ -339,9 +339,10 @@ interface PageResult {
   size: number
 }
 
-const loadData = async () => {
+const loadData = async (silent = false) => {
+  let loading: ReturnType<typeof ElLoading.service> | null = null
+  if (!silent) loading = ElLoading.service({ text: '加载告警数据...' })
   try {
-    const loading = ElLoading.service({ text: '加载告警数据...' })
     await Promise.all([loadDevices(), loadRoutes()])
     const params = {
       page: currentPage.value,
@@ -360,10 +361,23 @@ const loadData = async () => {
     imageItems.value = tableData.value.filter(item => item.image_http_url)
     const rules = new Set(tableData.value.map(item => item.rule_name).filter(Boolean))
     ruleList.value = Array.from(rules)
-    loading.close()
   } catch (e) {
     console.error('加载告警数据失败', e)
-    ElMessage.error('加载告警数据失败')
+    if (!silent) ElMessage.error('加载告警数据失败')
+  } finally {
+    loading?.close()
+  }
+}
+
+// 飞行时1秒静默轮询, 待机停止(飞行判定与地图一致: modeCode 非0且非14)
+let pollTimer: ReturnType<typeof setInterval> | null = null
+const checkAndRefresh = async () => {
+  try {
+    const devices = await request.get<Array<{ kind: string; modeCode?: number }>>('/devices/list')
+    const flying = (devices || []).some(d => d.kind === 'uav' && d.modeCode != null && d.modeCode !== 0 && d.modeCode !== 14)
+    if (flying) await loadData(true)
+  } catch {
+    // 静默
   }
 }
 
@@ -533,6 +547,8 @@ onMounted(async () => {
 
   window.addEventListener('mousemove', handleMouseMove)
   window.addEventListener('mouseup', handleMouseUp)
+
+  pollTimer = setInterval(checkAndRefresh, 1000)
 })
 
 const tableRowClassName = ({ row }: { row: AlarmData }): string => {
@@ -543,6 +559,10 @@ const tableRowClassName = ({ row }: { row: AlarmData }): string => {
 }
 
 onUnmounted(() => {
+  if (pollTimer) {
+    clearInterval(pollTimer)
+    pollTimer = null
+  }
   window.removeEventListener('mousemove', handleMouseMove)
   window.removeEventListener('mouseup', handleMouseUp)
 })
