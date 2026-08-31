@@ -1,22 +1,29 @@
 package com.dji.sikong.service;
 
+import cn.hutool.core.io.FileUtil;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONArray;
 import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
+import com.dji.sikong.config.MinioProperties;
 import com.dji.sikong.entity.SelfModelImageDetection;
 import com.dji.sikong.entity.ZhimouImageDetection;
 import com.dji.sikong.mapper.SelfModelImageDetectionMapper;
 import com.dji.sikong.mapper.ZhimouImageDetectionMapper;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 import javax.annotation.Resource;
 import java.math.BigDecimal;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 /**
  * 图片识别数据清洗服务 (二期新增)
@@ -41,6 +48,12 @@ public class ImageCleanupService {
 
     @Resource
     private SelfModelImageDetectionMapper selfModelImageDetectionMapper;
+
+    @Resource
+    private StringRedisTemplate stringRedisTemplate;
+
+    @Resource
+    private MinioProperties minioProperties;
 
     /**
      * 清洗单张图片
@@ -180,6 +193,79 @@ public class ImageCleanupService {
         }
         log.info("[清洗] 批量清洗完成, 成功={}", cleaned);
         return cleaned;
+    }
+
+    // ================================================================
+    // 阶段3新增：MinIO 批次状态流转辅助
+    // ================================================================
+
+    /**
+     * 阶段3新增：当某张图完成清洗后调用：
+     *   扫描 minio:flight:img:{taskUuid}* 是否全部被清理（keys 为空）
+     *     是 → minio:flight:{taskUuid} = COMPLETED（永久）
+     *          且 cleanupTempAfter=true 时删除 {minio.temp-dir}/{taskUuid} 下载目录
+     *   幂等：两次调也没事（SET 覆盖相同、文件删除第二次返回true）。
+     *
+     * @param taskUuid 飞行任务UUID（fh_sync 路径里的 media/ 下那个 UUID）
+     */
+    public void tryCompleteMinioBatch(String taskUuid) {
+        if (StrUtil.isBlank(taskUuid)) return;
+        try {
+            // 1. 仍有未完成的图片级key？
+            Set<String> pendingKeys = stringRedisTemplate.keys("minio:flight:img:" + taskUuid + "*");
+            if (pendingKeys != null && !pendingKeys.isEmpty()) {
+                log.debug("[MinIO批次] taskUuid={} 仍有 {} 张图片在清洗队列，暂不标记 COMPLETED",
+                        taskUuid, pendingKeys.size());
+                return;
+            }
+
+            // 1.5 DB 兜底：检查该批次是否还有 clean_status=0 的记录（防止 img key 时序空洞）
+            Long zhimouPending = zhimouImageDetectionMapper.selectCount(
+                    new LambdaQueryWrapper<ZhimouImageDetection>()
+                            .likeRight(ZhimouImageDetection::getLocalImageName, taskUuid + "/")
+                            .eq(ZhimouImageDetection::getDeleted, 0)
+                            .eq(ZhimouImageDetection::getCleanStatus, 0));
+            Long selfPending = selfModelImageDetectionMapper.selectCount(
+                    new LambdaQueryWrapper<SelfModelImageDetection>()
+                            .likeRight(SelfModelImageDetection::getLocalImageName, taskUuid + "/")
+                            .eq(SelfModelImageDetection::getDeleted, 0)
+                            .eq(SelfModelImageDetection::getCleanStatus, 0));
+            if ((zhimouPending != null && zhimouPending > 0) || (selfPending != null && selfPending > 0)) {
+                log.debug("[MinIO批次] taskUuid={} DB仍有未清洗记录 zhimou={}, self={}, 暂不标记 COMPLETED",
+                        taskUuid, zhimouPending, selfPending);
+                return;
+            }
+
+            // 2. 标记批次 COMPLETED 永久
+            String batchKey = "minio:flight:" + taskUuid;
+            String prev = stringRedisTemplate.opsForValue().get(batchKey);
+            if ("COMPLETED".equals(prev)) {
+                return; // 之前已标过
+            }
+            // 先 delete 清除原有 TTL（PROCESSING 时设置的 1800s），再 set 不带 TTL = 永久
+            stringRedisTemplate.delete(batchKey);
+            stringRedisTemplate.opsForValue().set(batchKey, "COMPLETED");
+            log.info("[MinIO批次] ✅ 标记 COMPLETED taskUuid={}", taskUuid);
+
+            // 3. 删除临时下载目录
+            if (minioProperties.isCleanupTempAfter()) {
+                String tempDir = minioProperties.getTempDir();
+                if (StrUtil.isNotBlank(tempDir)) {
+                    Path p = Paths.get(tempDir, taskUuid);
+                    try {
+                        if (FileUtil.exist(p.toFile())) {
+                            boolean del = FileUtil.del(p.toFile());
+                            log.info("[MinIO批次] 删除临时下载目录 {} taskUuid={}, result={}",
+                                    p.toAbsolutePath(), taskUuid, del);
+                        }
+                    } catch (Exception e) {
+                        log.warn("[MinIO批次] 删除临时目录失败 taskUuid={}, path={}", taskUuid, p, e);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.warn("[MinIO批次] tryCompleteMinioBatch 异常 taskUuid={}", taskUuid, e);
+        }
     }
 
     // ================================================================

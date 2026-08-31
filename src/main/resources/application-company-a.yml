@@ -74,3 +74,20 @@ zhimou:
   image:
     save-root-dir: H:/traeproject/zhoudao/zhimou-images
     url-prefix: /zhimou-img/
+
+# ============================================================
+# 阶段3：MinIO 轮询图片同步（司空2 fh_sync 同步到内网 MinIO）
+# 真实路径: flydata/fh_sync/{ORG_UUID}/{PROJECT_UUID}/media/{TASK_UUID}/{FILENAME}
+# ============================================================
+minio:
+  endpoint: http://192.168.2.200:9000
+  access-key: admin
+  secret-key: Admin@123456
+  bucket: flydata
+  scan-prefix: fh_sync/
+  poll-interval-ms: 30000
+  temp-dir: H:/traeproject/zhoudao/zhimou-minio-temp
+  cleanup-temp-after: true
+  validate-upload-count-before-process: true
+  batch-lock-ttl-sec: 1800
+  image-status-ttl-days: 7

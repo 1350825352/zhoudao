@@ -149,6 +149,25 @@ public interface ZhimouTaskService extends IService<ZhimouTask> {
                                      String applicationPackageId,
                                      String imageBaseDir);
 
+    /**
+     * 阶段3新增：同 createAndReportImageBatch(5参数)，额外支持：
+     *   1. customLocalImagePrefix：非空时，每张图的 local_image_name 会加上 "{prefix}/" 前缀；
+     *      用于区分不同飞行架次同名的 0001_V.jpeg，避免跨架次 local_image_name 冲突。
+     *   2. reportIntervalMs：每张图 reportImage 之间间隔毫秒；阶段3仍推荐 1000ms（知眸最小间隔约束）。
+     * 老方法 createAndReportImageBatch(5参数) 内部实现上等价于调用本重载，prefix=null, reportIntervalMs=1000。
+     *
+     * @param customLocalImagePrefix 阶段3传飞行任务 TASK_UUID（如 dbc84414-a612-...）；阶段2传 null
+     * @param reportIntervalMs       上报间隔毫秒（默认 1000）
+     * @return taskId 失败返回 null
+     */
+    String createAndReportImageBatch(java.util.List<java.io.File> imageFiles,
+                                     String aircraftSn,
+                                     String appId,
+                                     String applicationPackageId,
+                                     String imageBaseDir,
+                                     String customLocalImagePrefix,
+                                     long reportIntervalMs);
+
     /** 健康检查用: 查询当前活跃的码流(开启中/已开启) */
     List<LiveStream> listActiveLiveStreamsNeedZhimou();
 

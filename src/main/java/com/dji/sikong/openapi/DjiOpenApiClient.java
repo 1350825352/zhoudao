@@ -162,6 +162,52 @@ public class DjiOpenApiClient {
         return get("/openapi/v2.0/workspaces/" + workspaceId + "/flight-tasks/recent", projectUuid, query);
     }
 
+    // ========================================================================
+    // 阶段3新增：飞行任务图片同步专用（MinIO轮询 -> 司空2数据校验 + SN获取）
+    // ========================================================================
+
+    /**
+     * 获取飞行任务"详情"接口（含 flight_pieces[].drone_sn）
+     *   文档：/openapi/v2.0/flight-task/detail
+     *   @param workspaceId  必填，传 DjiOpenApiProperties.defaultProjectUuid (即 826ccf49-...)
+     *   @param taskUuid     飞行任务 UUID（即 fh_sync/{org}/{proj}/media/{TASK_UUID} 的最后一段）
+     *   返回：flight_pieces[0].drone_sn / .drone_info / .task_name / .take_off_airport_sn / status
+     */
+    public JsonNode getFlightTaskPiecesDetail(String workspaceId, String taskUuid) {
+        Map<String, Object> query = new HashMap<>();
+        String actualWs = StrUtil.isNotBlank(workspaceId) ? workspaceId : properties.getDefaultProjectUuid();
+        query.put("workspace_id", actualWs);
+        query.put("task_uuid", taskUuid);
+        // projectUuid 传 actualWs 即可 (buildHeaders 需要的是 X-Project-Uuid = 项目)
+        return get("/openapi/v2.0/flight-task/detail", actualWs, query);
+    }
+
+    /**
+     * 获取飞行任务"通用信息"接口（含 folder_info.expected_file_count / uploaded_file_count）
+     *   文档：/openapi/v2.0/flight-task/{taskUuid}
+     *   返回：folder_info.{expected_file_count, uploaded_file_count}
+     */
+    public JsonNode getFlightTaskInfo(String taskUuid) {
+        Map<String, Object> query = new HashMap<>();
+        String actualWs = properties.getDefaultProjectUuid();
+        query.put("workspace_id", actualWs);
+        return get("/openapi/v2.0/flight-task/" + taskUuid, actualWs, query);
+    }
+
+    /**
+     * 获取飞行任务媒体列表接口
+     *   文档：/openapi/v2.0/flight-task/{taskUuid}/media
+     *   返回：list[name]，用于与 MinIO 实际文件名进行二次校验
+     */
+    public JsonNode getFlightTaskMedia(String taskUuid) {
+        Map<String, Object> query = new HashMap<>();
+        String actualWs = properties.getDefaultProjectUuid();
+        query.put("workspace_id", actualWs);
+        query.put("pageSize", 500);
+        query.put("pageNum", 1);
+        return get("/openapi/v2.0/flight-task/" + taskUuid + "/media", actualWs, query);
+    }
+
     /** 获取STS临时凭证 */
     public JsonNode getStsToken(String projectUuid) {
         Map<String, Object> body = new HashMap<>();

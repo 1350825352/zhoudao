@@ -1,9 +1,11 @@
 package com.dji.sikong.service;
 
 import cn.hutool.http.HttpRequest;
+import cn.hutool.core.util.StrUtil;
 import com.dji.sikong.common.ImageExifUtil;
 import com.dji.sikong.entity.SelfModelImageDetection;
 import com.dji.sikong.mapper.SelfModelImageDetectionMapper;
+import com.dji.sikong.service.impl.ZhimouTaskServiceImpl;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
@@ -43,6 +45,9 @@ public class SelfModelDetectService {
     @Resource
     private SelfModelImageDetectionMapper selfModelImageDetectionMapper;
 
+    @Resource
+    private ZhimouTaskServiceImpl zhimouTaskService;
+
     /**
      * 同步调用自有模型识别并入库
      *
@@ -52,6 +57,17 @@ public class SelfModelDetectService {
      * @return 入库后的实体 (含数据库id); 调用失败也入库但call_status=2
      */
     public SelfModelImageDetection detectAndSave(File imageFile, BigDecimal threshold, String imageBaseDir) {
+        // 阶段2旧签名：customLocalImageName=null，沿用旧local_image_name=文件去扩展名
+        return detectAndSave(imageFile, threshold, imageBaseDir, null);
+    }
+
+    /**
+     * 阶段3新增：同 detectAndSave(3参数)，额外允许指定 customLocalImageName
+     *  当 customLocalImageName != null 时，直接使用它作为 DB 和 Redis 清洗关联键；
+     *  阶段3传 TASK_UUID + "/" + baseNameWithoutExt，保证跨架次不冲突。
+     */
+    public SelfModelImageDetection detectAndSave(File imageFile, BigDecimal threshold, String imageBaseDir,
+                                                  String customLocalImageName) {
         SelfModelImageDetection rec = new SelfModelImageDetection();
         rec.setServerUrl(SERVER_URL);
         rec.setCallStatus(0);
@@ -62,8 +78,13 @@ public class SelfModelDetectService {
         try {
             String fileName = imageFile.getName();
             int dotIdx = fileName.lastIndexOf('.');
-            String localImageName = dotIdx > 0 ? fileName.substring(0, dotIdx) : fileName;
+            String baseName = dotIdx > 0 ? fileName.substring(0, dotIdx) : fileName;
             String ext = dotIdx > 0 ? fileName.substring(dotIdx + 1).toLowerCase() : "jpg";
+            // local_image_name 选择：
+            //   阶段2 (customLocalImageName == null) -> baseName = 文件去扩展名
+            //   阶段3 (customLocalImageName != null) -> 传入的 customLocalImageName (已带 TASK_UUID/ 前缀)
+            String localImageName = StrUtil.isNotBlank(customLocalImageName)
+                    ? customLocalImageName : baseName;
             rec.setLocalImageName(localImageName);
             rec.setImageFormat(ext);
 
@@ -135,14 +156,12 @@ public class SelfModelDetectService {
                 if (data.has("image_path")) {
                     rec.setServerImagePath(data.path("image_path").asText(null));
                 }
-                // 处理时间
                 if (data.has("processing_time_ms")) {
                     rec.setProcessingTimeMs(data.path("processing_time_ms").asInt());
                 }
                 if (data.has("processed_at")) {
                     rec.setProcessedAt(data.path("processed_at").asText(null));
                 }
-                // 识别结果
                 JsonNode detections = data.path("detections");
                 int hit = (detections != null && detections.isArray()) ? detections.size() : 0;
                 rec.setHitCount(hit);
@@ -162,6 +181,11 @@ public class SelfModelDetectService {
         selfModelImageDetectionMapper.insert(rec);
         log.info("[自有模型] 入库 id={}, localImageName={}, callStatus={}, hit={}",
                 rec.getId(), rec.getLocalImageName(), rec.getCallStatus(), rec.getHitCount());
+
+        // 5. 阶段3新增：写 Redis self=1，若知眸回调已到达(zhimou=1)立刻自动清洗
+        if (StrUtil.isNotBlank(rec.getLocalImageName())) {
+            zhimouTaskService.triggerImageCleanupIfReadyForSelf(rec.getLocalImageName());
+        }
 
         return rec;
     }

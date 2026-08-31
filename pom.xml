@@ -93,6 +93,13 @@
             <artifactId>metadata-extractor</artifactId>
             <version>${metadata-extractor.version}</version>
         </dependency>
+
+        <!-- MinIO 对象存储 SDK (用于阶段3轮询扫描司空2同步的航拍图片) -->
+        <dependency>
+            <groupId>io.minio</groupId>
+            <artifactId>minio</artifactId>
+            <version>8.5.7</version>
+        </dependency>
     </dependencies>
 
     <build>

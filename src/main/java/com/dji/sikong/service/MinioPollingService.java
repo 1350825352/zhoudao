@@ -100,6 +100,11 @@ public class MinioPollingService {
     // 全局互斥锁：确保同一时间只有一个批次在处理（知眸并发仅2个）
     private final AtomicBoolean processingLock = new AtomicBoolean(false);
 
+    // 同步卡住检测：数量校验持续不匹配的批次追踪 key 前缀
+    private static final String MISMATCH_PREFIX = "minio:flight:mismatch:";
+    // 同步卡住判定阈值：MinIO 文件数连续 10 分钟无变化 → 判定司空2同步中断，永久跳过该批次
+    private static final long STUCK_SKIP_MS = 10 * 60 * 1000L;
+
     // fh_sync/{ORG_UUID}/{PROJECT_UUID}/media/{TASK_UUID}/{FILENAME.ext}
     private volatile Pattern pathRegex = null;
 
@@ -237,6 +242,7 @@ public class MinioPollingService {
                 if (expected <= 0 || uploaded < expected) {
                     log.info("[MinIO轮询] taskUuid={} 仍在同步中 (uploaded={}/expected={})，跳过本轮",
                             tuuid, uploaded, expected);
+                    checkSyncStuck(tuuid, g.files.size());
                     return;
                 }
             }
@@ -245,13 +251,22 @@ public class MinioPollingService {
             int mediaCnt = 0;
             if (media != null && media.path("code").asInt(-1) == 0) {
                 JsonNode arr = media.path("data").has("list") ? media.path("data").path("list") : media.path("data");
-                if (arr.isArray()) mediaCnt = arr.size();
+                if (arr.isArray()) {
+                    for (JsonNode item : arr) {
+                        // 过滤非媒体记录：AutoRecord 等元数据（file_type=unsupported, size=0）不会同步到 MinIO
+                        if ("unsupported".equalsIgnoreCase(item.path("file_type").asText())) continue;
+                        mediaCnt++;
+                    }
+                }
             }
             if (mediaCnt > 0 && mediaCnt != g.files.size()) {
                 log.info("[MinIO轮询] taskUuid={} media接口数={} != MinIO数={}，同步未完成跳过本轮",
                         tuuid, mediaCnt, g.files.size());
+                checkSyncStuck(tuuid, g.files.size());
                 return;
             }
+            // 校验通过 → 清除同步卡住计时器
+            stringRedisTemplate.delete(MISMATCH_PREFIX + tuuid);
         }
 
         // (3) 抢分布式锁：SETNX PROCESSING TTL
@@ -348,6 +363,52 @@ public class MinioPollingService {
         }
     }
 
+    /**
+     * 同步卡住兜底：数量校验持续不匹配的批次，若 MinIO 文件数连续 10 分钟无变化，
+     * 判定司空2同步已中断（不会再同步），将批次标记 COMPLETED 永久跳过，
+     * 避免每 30 秒轮询反复调用 DJI API 空转消耗资源。
+     * 若文件数仍在变化（同步进行中），则重置计时器。
+     */
+    private void checkSyncStuck(String taskUuid, int currentCount) {
+        try {
+            String mismatchKey = MISMATCH_PREFIX + taskUuid;
+            Map<Object, Object> meta = stringRedisTemplate.opsForHash().entries(mismatchKey);
+            String now = String.valueOf(System.currentTimeMillis());
+            if (meta == null || meta.isEmpty()) {
+                // 首次发现数量不匹配 → 开始计时
+                Map<String, String> init = new HashMap<>();
+                init.put("lastCount", String.valueOf(currentCount));
+                init.put("lastChange", now);
+                stringRedisTemplate.opsForHash().putAll(mismatchKey, init);
+                stringRedisTemplate.expire(mismatchKey, 15, TimeUnit.MINUTES);
+                return;
+            }
+            String lastCount = (String) meta.get("lastCount");
+            String lastChange = (String) meta.get("lastChange");
+            if (StrUtil.isBlank(lastCount) || StrUtil.isBlank(lastChange)) {
+                // 元数据异常 → 重置
+                stringRedisTemplate.delete(mismatchKey);
+                return;
+            }
+            if (String.valueOf(currentCount).equals(lastCount)) {
+                long stuckMs = System.currentTimeMillis() - Long.parseLong(lastChange);
+                if (stuckMs >= STUCK_SKIP_MS) {
+                    log.warn("[MinIO轮询] taskUuid={} 文件数={} 已连续 {} 分钟无变化，判定司空2同步中断，标记 COMPLETED 永久跳过该批次",
+                            taskUuid, currentCount, TimeUnit.MILLISECONDS.toMinutes(stuckMs));
+                    stringRedisTemplate.opsForValue().set("minio:flight:" + taskUuid, "COMPLETED");
+                    stringRedisTemplate.delete(mismatchKey);
+                }
+            } else {
+                // 文件数仍在变化 → 同步进行中，重置计时
+                stringRedisTemplate.opsForHash().put(mismatchKey, "lastCount", String.valueOf(currentCount));
+                stringRedisTemplate.opsForHash().put(mismatchKey, "lastChange", now);
+                stringRedisTemplate.expire(mismatchKey, 15, TimeUnit.MINUTES);
+            }
+        } catch (Exception e) {
+            log.warn("[MinIO轮询] taskUuid={} 同步卡住检测异常（不影响主流程）", taskUuid, e);
+        }
+    }
+
     private List<File> downloadBatch(String taskUuid, List<TaskFile> files) {
         String tempDir = minioProperties.getTempDir();
         if (StrUtil.isBlank(tempDir)) {
@@ -379,6 +440,15 @@ public class MinioPollingService {
                             .build())) {
                         Files.copy(in, target, StandardCopyOption.REPLACE_EXISTING);
                     }
+                }
+                // 零成本保险：拦截空文件/截断文件（MinIO 原子性保证上传侧完整，此处防下载中断）
+                long size = target.toFile().length();
+                if (size < 1024) {
+                    FileUtil.del(target.toFile());
+                    fail++;
+                    log.warn("[MinIO轮询] 文件过小疑似下载不完整，已删除 objectKey={}, size={}B, taskUuid={}",
+                            tf.objectKey, size, taskUuid);
+                    continue;
                 }
                 out.add(target.toFile());
                 ok++;
