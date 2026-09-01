@@ -44,6 +44,15 @@ let alertLabel: any = null
 let alertTimer: ReturnType<typeof setTimeout> | null = null
 let videoUrlRefreshTimer: ReturnType<typeof setInterval> | null = null
 
+// ================ 飞行轨迹 ================
+// 飞行模式集合(与后端 FLYING_MODES 一致): 3-12,15-21
+const FLYING_MODES = new Set([3,4,5,6,7,8,9,10,11,12,15,16,17,19,20,21])
+// 每架飞机的轨迹点集: sn -> [{lng, lat}, ...]
+let trajectoryPoints: Map<string, {lng:number, lat:number}[]> = new Map()
+// 每架飞机的轨迹线对象: sn -> Polyline
+let trajectoryLines: Map<string, any> = new Map()
+let trajectoryTimer: ReturnType<typeof setInterval> | null = null
+
 // 保存告警信息，用于地图重绘后重新添加
 let alertInfo: { lng: number; lat: number; name: string } | null = null
 
@@ -171,6 +180,49 @@ function updateMapMarkers() {
     }
   } catch (e) {
     console.warn('[Tianditu updateMarkers warn]', e)
+  }
+}
+
+// ================ 飞行轨迹 ================
+function updateTrajectory() {
+  const T = (window as any).T
+  if (!T || !mapInstance) return
+  try {
+    for (const dev of store.devices) {
+      if (dev.kind === 'airport' || !dev.sn) continue
+      const sn = dev.sn
+      const isFlying = dev.modeCode != null && FLYING_MODES.has(dev.modeCode)
+
+      if (isFlying && dev.lng != null && dev.lat != null) {
+        // 飞行中: 采点
+        const points = trajectoryPoints.get(sn) || []
+        const last = points[points.length - 1]
+        // 避免重复点
+        if (!last || last.lng !== dev.lng || last.lat !== dev.lat) {
+          points.push({ lng: dev.lng, lat: dev.lat })
+          trajectoryPoints.set(sn, points)
+        }
+      }
+      // 画线(≥2个点才画), 飞行中和降落后都保留, 刷新页面才消失
+      const pts = trajectoryPoints.get(sn)
+      if (pts && pts.length >= 2) {
+        const oldLine = trajectoryLines.get(sn)
+        if (oldLine) {
+          try { mapInstance.removeOverLay(oldLine) } catch (_) {}
+        }
+        const lngLatList = pts.map(p => new T.LngLat(p.lng, p.lat))
+        const polyline = new T.Polyline(lngLatList, {
+          color: '#2E8BFF',
+          weight: 3,
+          opacity: 0.8,
+          lineStyle: 'solid'
+        })
+        mapInstance.addOverLay(polyline)
+        trajectoryLines.set(sn, polyline)
+      }
+    }
+  } catch (e) {
+    console.warn('[Trajectory update warn]', e)
   }
 }
 
@@ -415,12 +467,15 @@ watch(() => store.currentRoute, () => {
 onMounted(() => {
   // 挂载showAlertMarker到window对象供外部调用
   ;(window as any).showAlertMarker = showAlertMarker
-  
+
   nextTick(() => {
     const T = (window as any).T
     const safeInit = () => setTimeout(() => {
       initTiandituMap()
       setTimeout(() => { try { mapInstance && mapInstance.checkResize && mapInstance.checkResize() } catch (_) {} }, 400)
+      // 启动飞行轨迹定时器(0.5秒,与设备数据轮询频率一致)
+      if (trajectoryTimer) clearInterval(trajectoryTimer)
+      trajectoryTimer = setInterval(() => updateTrajectory(), 500)
     }, 600)
     if (T) {
       safeInit()
@@ -463,6 +518,16 @@ onUnmounted(() => {
     clearInterval(videoUrlRefreshTimer)
     videoUrlRefreshTimer = null
   }
+  // 清理飞行轨迹定时器和轨迹线
+  if (trajectoryTimer) {
+    clearInterval(trajectoryTimer)
+    trajectoryTimer = null
+  }
+  trajectoryLines.forEach(line => {
+    try { mapInstance && mapInstance.removeOverLay(line) } catch (_) {}
+  })
+  trajectoryLines.clear()
+  trajectoryPoints.clear()
 })
 </script>
 

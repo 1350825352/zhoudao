@@ -21,4 +21,19 @@ app.use(createPinia())
 app.use(router)
 app.use(ElementPlus, { locale: zhCn })
 
+// ===== 一键登录支持：URL ?token= 自动写入 sessionStorage =====
+;(function () {
+  const q = new URLSearchParams(window.location.search)
+  const urlToken = q.get('token')
+    || (window.location.hash.match(/[?&]token=([^&]+)/) || [])[1]
+  if (urlToken) {
+    sessionStorage.setItem('screen-token', urlToken)
+    q.delete('token')
+    const u = new URL(window.location.href)
+    u.search = q.toString()
+    window.history.replaceState({}, '', u)
+  }
+})()
+// ===== 结束 =====
+
 app.mount('#app')

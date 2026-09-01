@@ -1,0 +1,224 @@
+================================================================================
+          功能设计说明 - 飞行轨迹 + 外部认证 + 数据推送
+================================================================================
+制定日期: 2026-09-01
+状态: 方案定稿（待实施）
+
+================================================================================
+一、大屏飞行轨迹显示（已实施 2026-09-01）
+================================================================================
+
+背景: 大屏 screen-v3 地图只有飞机当前位置图标，看不到飞行轨迹。
+      用户要求：飞行时实时显示轨迹，降落后保留轨迹，刷新页面轨迹消失。
+
+设计原则: 纯前端实现，零后端改动，零数据库，零接口。
+
+地图: 天地图 T.Map（EPSG:4326 投影），已有 Polyline 画线能力。
+设备数据: store.devices 每 2 秒轮询返回飞机实时经纬度 + modeCode。
+
+飞行模式判定（与后端 FLYING_MODES 一致）:
+  modeCode ∈ {3,4,5,6,7,8,9,10,11,12,15,16,17,19,20,21} = 飞行中
+  其它 = 地面/待机/未连接
+
+实现文件: screen-v3/src/views/home/mainMap.vue（约 50 行新增代码）
+
+变量:
+  trajectoryPoints: Map<sn, {lng,lat}[]>    每架飞机的轨迹点集（内存）
+  trajectoryLines:  Map<sn, Polyline>        每架飞机的轨迹线对象
+  trajectoryTimer:  setInterval(1秒)         采样定时器
+
+updateTrajectory() 逻辑（每 1 秒执行）:
+  遍历 store.devices 中的飞机设备（kind != 'airport'）
+  ├─ 飞行中（modeCode ∈ FLYING_MODES 且 lng/lat 有值）
+  │   → push 当前位置到 trajectoryPoints[sn]（去重）
+  │   → 用全部点重画蓝色 Polyline（先删旧线再画新线）
+  └─ 已画线的飞机（trajectoryPoints 有数据但当前不在飞行）
+      → 不采点，但轨迹线保留在地图上不清除
+
+轨迹线样式: 蓝色 #2E8BFF，线宽 3，透明度 0.8
+航线样式: 红色 #FF4444，线宽 6（预设航线，区别于轨迹）
+
+时序效果:
+  起飞（modeCode 进入飞行集合） → 开始每秒采点，蓝色轨迹线实时延伸
+  飞行中                          → 轨迹线跟随飞机实时增长
+  降落（modeCode 变为非飞行）     → 停止采点，轨迹线保留在地图上
+  刷新页面                        → 内存重置，轨迹自然消失
+
+生命周期:
+  onMounted  → 地图初始化后启动 1 秒定时器
+  onUnmounted → 清除定时器 + 移除地图上所有轨迹线 + 清空内存
+
+独立性:
+  轨迹线由 trajectoryLines Map 独立管理，updateMapMarkers 清除 deviceMarkers
+  时不影响轨迹线。
+
+================================================================================
+二、外部系统 API Key 换取 Token 认证
+================================================================================
+
+背景: 本系统是父系统的子项目。父系统需要通过获取 token 来调用本系统接口。
+      不引入 JWT，复用现有 Redis token 机制。
+
+现有认证机制（AuthController.java）:
+  用户名密码 → 生成 UUID token → 存 Redis (sikong:token:{token})
+  → TTL 2 小时（滑动过期，验证时重置 TTL）
+
+新增接口:
+  POST /api/auth/api-key-login
+  Headers: X-API-Key: {apiKey}
+           X-API-Secret: {secret}
+  → 验证 apiKey + secret（配置在 yml）
+  → 生成 UUID token 存入 Redis（TTL = 24 小时）
+  → 返回 { token, userInfo, expiresIn: 86400 }
+
+Token TTL:
+  普通用户登录: 2 小时（安全要求高）
+  API Key 换 token: 24 小时（系统间调用，安全要求低）
+  两者都支持滑动过期（验证时重置 TTL）
+
+父系统处理过期（方式1: 过期重换）:
+  父系统调接口 → 收到 401（token 过期）
+      → 自动调 api-key-login 换新 token
+      → 用新 token 重发原请求
+
+配置（application-company-a.yml）:
+  external-auth:
+    api-key: "zhoudao-parent-key"
+    api-secret: "a8f3b2c1d9e7..."
+    token-ttl: 86400
+
+改动量:
+  AuthController.java 新增 1 个接口（约 30 行）
+  新增 1 个配置类读取 external-auth 配置
+
+================================================================================
+三、清洗后异步推送识别数据到外部接口
+================================================================================
+
+背景: 知眸图片识别结果清洗完成后，需要把告警数据（含经纬度、高度、标注图URL）
+      POST 推送到父系统的接收接口。
+
+推送时机: 清洗完成（clean_status 写入后），只推 clean_status=1（真实告警）
+          不推 clean_status=2（误识别）和 clean_status=0（未清洗/无目标）
+
+推送方式: 异步并行（每条独立线程，互不等待）
+          一批 15 张图可能同时产生多条 clean_status=1 记录，各自独立推送
+
+推送数据格式（JSON POST）:
+  {
+    "aircraft_sn": "1581F8HGX252F00A018X",
+    "task_id": "1587912981127494992",
+    "image_name": "DJI_20260831181515_0001_V",
+    "latitude": 32.060255,
+    "longitude": 118.796877,
+    "altitude": 85.5,
+    "app_name": "小客车识别",
+    "hit_count": 10,
+    "clean_status": 1,
+    "clean_remark": "正常:知眸11个目标中10个匹配自有模型",
+    "annotated_image_url": "http://192.168.2.130:8080/api/image-detect-img/20260831/xxx/annotated/DJI_xxx.jpg",
+    "detect_time": "2026-08-31 17:12:42"
+  }
+
+推送数据来源:
+  aircraft_sn      → ZhimouImageDetection.deviceId
+  task_id          → ZhimouImageDetection.zhimouTaskId
+  image_name       → ZhimouImageDetection.localImageName
+  latitude         → ZhimouImageDetection.latitude（图片EXIF GPS）
+  longitude        → ZhimouImageDetection.longitude
+  altitude         → ZhimouImageDetection.altitude
+  app_name         → ZhimouImageDetection.appName
+  hit_count        → ZhimouImageDetection.hitCount
+  clean_status     → ZhimouImageDetection.cleanStatus
+  clean_remark     → ZhimouImageDetection.cleanRemark
+  annotated_image_url → 本系统拼接（/api/image-detect-img/ + annotated_local_path）
+  detect_time      → ZhimouImageDetection.createTime
+
+确认机制:
+  对方返回 HTTP 200 + {"code":0} → 推送成功
+  对方返回非200 / 超时 / 响应体不含 code:0 → 进入重试
+  confirm-mode: "code0"（需要 code:0 确认）
+  confirm-mode: "http200"（降级: 只看 HTTP 200 就算成功）
+
+重试机制（内网环境，快速重试）:
+  超时时间: 3 秒（内网正常响应 < 50ms）
+  最大推送: 3 次
+  重试间隔: 第1次失败等 3 秒 → 重试
+            第2次失败等 5 秒 → 重试
+            第3次失败 → 记录 ERROR 日志（含推送数据，方便人工补推）
+
+最坏情况时间线（3次都失败）:
+  0s    第1次推送（3秒超时）→ 失败
+  6s    第2次推送（3秒超时）→ 失败（等3秒后发）
+  14s   第3次推送（3秒超时）→ 失败（等5秒后发）→ 记录 ERROR 日志
+  总计 17 秒兜底完毕
+
+正常情况（第1次就成功）:
+  < 100ms 完成
+
+并行推送:
+  10 条消息各自独立异步线程推送，互不等待
+  正常情况 10 条 < 1 秒全部完成
+  最坏情况 10 条 17 秒全部兜底完毕
+
+重试实现:
+  用 ScheduledExecutorService（延迟调度线程池）
+  每次重试独立线程，不阻塞清洗流程、不阻塞后续推送
+  不引入 MQ 等重量级组件
+
+配置（application-company-a.yml）:
+  push:
+    enabled: true                          # 推送开关
+    url: "http://父系统IP:端口/api/receive"  # 目标地址
+    timeout: 3000                           # 单次请求超时(毫秒)
+    max-retries: 3                          # 最大重试次数
+    retry-delays: [3000, 5000]             # 重试间隔(毫秒)
+    confirm-mode: "code0"                  # 确认模式
+
+不推送的情况:
+  clean_status = 2（误识别，不推）
+  clean_status = 0（未清洗/无目标行，不推）
+  push.enabled = false（yml 可关）
+
+改动量:
+  新建 PushService.java（推送+重试逻辑，约 100 行）
+  ImageCleanupService.java 清洗完成后调 PushService（1 行调用）
+  application-company-a.yml 新增 push 配置段
+
+================================================================================
+四、实施顺序
+================================================================================
+
+1. 飞行轨迹（已完成）
+   mainMap.vue 新增轨迹绘制代码 + 1 秒定时器
+
+2. 外部认证（待实施）
+   AuthController 新增 api-key-login 接口
+   新增配置类读取 external-auth
+   yml 配置 api-key/api-secret/token-ttl
+
+3. 数据推送（待实施）
+   新建 PushService（推送+确认+重试）
+   ImageCleanupService 清洗完成后调 PushService
+   yml 配置 push.url/timeout/retry
+
+4. 编译重启 + 验证
+   父系统用 api-key 换 token → 调接口验证
+   清洗完成后 → 检查推送日志 → 确认父系统收到数据
+
+================================================================================
+五、两个功能的关系
+================================================================================
+
+功能1（外部认证）: 父系统主动调本系统接口拉数据时用 token 认证
+功能2（数据推送）: 本系统主动向父系统推数据
+
+两者独立，互不依赖:
+  功能1 不依赖功能2
+  功能2 不依赖功能1（推送不需要 token，内网信任）
+
+如果父系统接收接口需要鉴权:
+  在 push 配置里加 auth-header 配置项，推送时带上固定 Header
+  （当前内网环境暂不需要）
+
+================================================================================

@@ -55,6 +55,9 @@ public class ImageCleanupService {
     @Resource
     private MinioProperties minioProperties;
 
+    @Resource
+    private PushService pushService;
+
     /**
      * 清洗单张图片
      *
@@ -153,6 +156,10 @@ public class ImageCleanupService {
             z.setCleanRemark(rm);
             z.setCleanTime(LocalDateTime.now());
             zhimouImageDetectionMapper.updateById(z);
+            // 异步推送 (只推 clean_status=1 真实告警)
+            if (cs == 1) {
+                pushService.pushAlarmResult(z);
+            }
             log.info("[清洗]   行id={} app={} zTargets={} matched={} → clean={}",
                     z.getId(), z.getAppName(), zt, matched, cs);
         }
@@ -357,6 +364,10 @@ public class ImageCleanupService {
             z.setCleanTime(now);
             z.setCleanRemark(remark);
             zhimouImageDetectionMapper.updateById(z);
+            // 异步推送 (只推 clean_status=1 真实告警)
+            if (cleanStatus == 1) {
+                pushService.pushAlarmResult(z);
+            }
         }
         for (SelfModelImageDetection s : sRecs) {
             s.setCleanStatus(cleanStatus);

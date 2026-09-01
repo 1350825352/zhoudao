@@ -91,3 +91,22 @@ minio:
   validate-upload-count-before-process: true
   batch-lock-ttl-sec: 1800
   image-status-ttl-days: 7
+
+# ============================================================
+# 外部系统认证 (API Key 换取 Token)
+# ============================================================
+external-auth:
+  api-key: "zhoudao-parent-key"
+  api-secret: "a8f3b2c1d9e7f0a5"
+  token-ttl: 86400
+
+# ============================================================
+# 识别数据推送 (清洗后异步POST到外部接口)
+# ============================================================
+push:
+  enabled: true
+  url: "http://192.168.2.150:9090/api/receive"
+  timeout: 3000
+  max-retries: 3
+  retry-delays: [3000, 5000]
+  confirm-mode: "code0"

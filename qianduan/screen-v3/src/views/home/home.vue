@@ -362,7 +362,7 @@ onMounted(() => {
   loadStats()
   statsTimer = setInterval(loadStats, 12 * 60 * 60 * 1000)
   loadData()
-  refreshTimer = setInterval(loadData, 2000)
+  refreshTimer = setInterval(loadData, 500)
 })
 
 onUnmounted(() => {

@@ -6,6 +6,7 @@ import com.dji.sikong.entity.User;
 import com.dji.sikong.service.UserService;
 
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.web.bind.annotation.*;
 
@@ -14,6 +15,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
@@ -29,6 +31,15 @@ public class AuthController {
 
     @Resource
     private RedisTemplate<String, Object> redisTemplate;
+
+    @Value("${external-auth.api-key:}")
+    private String extApiKey;
+
+    @Value("${external-auth.api-secret:}")
+    private String extApiSecret;
+
+    @Value("${external-auth.token-ttl:86400}")
+    private long extTokenTtl;
 
     private static final String TOKEN_PREFIX = "sikong:token:";
 
@@ -135,6 +146,51 @@ public class AuthController {
             return R.ok(result);
         } catch (Exception e) {
             log.error("[认证] 登录失败, error={}", e.getMessage(), e);
+            return R.fail(500, "登录失败: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 外部系统API Key换取Token (24小时TTL + 滑动过期)
+     * Headers: X-API-Key, X-API-Secret
+     */
+    @PostMapping("/api-key-login")
+    public R<Map<String, Object>> apiKeyLogin(
+            @RequestHeader(value = "X-API-Key", required = false) String key,
+            @RequestHeader(value = "X-API-Secret", required = false) String secret) {
+        try {
+            log.info("[认证] API Key登录请求, key={}", key);
+
+            if (extApiKey == null || extApiKey.isEmpty() || extApiSecret == null || extApiSecret.isEmpty()) {
+                return R.fail(500, "API Key认证未配置");
+            }
+            if (!extApiKey.equals(key) || !extApiSecret.equals(secret)) {
+                log.warn("[认证] API Key验证失败, key={}", key);
+                return R.fail(401, "API Key或Secret错误");
+            }
+
+            String token = UUID.randomUUID().toString().replace("-", "");
+
+            Map<String, Object> userInfo = new LinkedHashMap<>();
+            userInfo.put("id", 0);
+            userInfo.put("username", "external-system");
+            userInfo.put("nickname", "外部系统");
+            userInfo.put("dept", "信息中心");
+            userInfo.put("token", token);
+            userInfo.put("hasAdminAccess", true);
+
+            redisTemplate.opsForValue().set(TOKEN_PREFIX + token, userInfo, extTokenTtl, TimeUnit.SECONDS);
+
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("token", token);
+            result.put("username", "external-system");
+            result.put("name", "外部系统");
+            result.put("expiresIn", extTokenTtl);
+
+            log.info("[认证] API Key登录成功, token={}, ttl={}s", token, extTokenTtl);
+            return R.ok(result);
+        } catch (Exception e) {
+            log.error("[认证] API Key登录失败, error={}", e.getMessage(), e);
             return R.fail(500, "登录失败: " + e.getMessage());
         }
     }

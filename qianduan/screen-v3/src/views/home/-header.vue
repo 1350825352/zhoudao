@@ -161,8 +161,8 @@ const isShow = ref(false)
 
 function goAdmin() {
   const token = sessionStorage.getItem('screen-token')
-  // 开发模式直接跳转 admin-v3 端口(3201), 生产模式用 /admin 路径
-  const adminBase = import.meta.env.DEV ? 'http://localhost:3201' : '/admin'
+  // 开发模式用 192.168.2.130:3201, 生产模式用 /admin 路径
+  const adminBase = import.meta.env.DEV ? 'http://192.168.2.130:3201' : '/admin'
   if (token) {
     // 使用 hash 参数传递 token，刷新后仍能从 URL 中读取
     window.open(`${adminBase}/#/?token=${token}`, '_blank')

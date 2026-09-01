@@ -2,7 +2,9 @@
           二期图片识别 - 阶段2补充设计说明（照片告警解耦方案）
 ================================================================================
 制定日期: 2026-08-31
-状态: 方案定稿（待实施）
+最后更新: 2026-08-31（今日实飞补充：目录解耦/标注图体积/一结果一行/清洗逐行独立/
+                        误识别显示口径/告警实时轮询/enhance开启/标注图URL时效）
+状态: 已实施+飞行实测通过（commit 23707d1, a4cb262, 1c1651b, d329d8e, 68b4308）
 背景: 告警管理页面显示的图片是 MinIO 原图而非知眸标注图；一期/二期图片
       文件混存；警情数据源全局单选切换无法同时查看两种告警。
 
@@ -39,129 +41,350 @@ screen (3202):
           video_task / image_task 两个识别任务开关保持原样不动。
 
 --------------------------------------------------------------------------------
-三、数据链路（照片告警全流程）
+三、数据链路（照片告警全流程）—— 实施后实际纠正版
 --------------------------------------------------------------------------------
 
-MinIO 原图下载 (临时目录)
-    ├──→ 知眸识别 ──命中──→ 回调带 apps[0].image（标注图URL）
-    │                        ↓ 【新增】下载 → 转PNG → 落盘 annotated/
-    │                        ↓ 写 DB 字段 annotated_local_path
-    ├──→ 自有模型识别 ──→ 【改】原图落盘 original/（不再进一期目录）
+MinIO 原图下载 (临时目录 zhimou-minio-temp/{taskUuid}/, 批次COMPLETED后删除)
+    │
+    ├─→ 【纠正】上传知眸前本地暂存 → 二期 zhimou-image-detect/{date}/{taskUuid}/original/
+    │       Redis meta.local_image_path 指向二期 original/，**不再写一期目录**
+    │
+    ├─→ 知眸 reportImage(image_id, device_id, **enhance=1 开启高分辨率小目标增强**)
+    │       ↓ 异步回调 POST /api/zhimou/callback
+    │   回调格式: data.apps = [ 应用包1(objects:[{x,y,name,color}]), 应用包2, ... ]
+    │       ↓ 【关键决策 20260831实飞】一结果一行（不是一图一行、也不是合并成一行）
+    │           ├─ for each app 命中 → 插一行记录(zhimou_image_detection)
+    │           ├─   每行 app_name/hit_count 单值，不再拼接
+    │           ├─   每行 targets_json 只保留当前 app 的 objects（独立可重算）
+    │           ├─   每行独立下载该 app 的标注图 (**直接存JPEG, 不转PNG!**)
+    │           ├─     文件名 {baseName}_{appId}.jpg（防止两app重名）
+    │           ├─   每行写自己的 annotated_local_path（单路径，不再逗号拼接）
+    │           └─ 全部插完 → imgKey zhimou=1 → 尝试触发清洗
+    │
+    ├─→ 自有模型识别 SelfModelDetectService
+    │       原图落盘二期 zhimou-image-detect/{date}/{taskUuid}/original/
+    │       插入 self_model_image_detection → imgKey self=1 → 尝试触发清洗
+    │
+    ↓ 两侧到齐 → 逐行独立清洗 ImageCleanupService.cleanupSingleImage()
+    │   【关键决策 20260831实飞】不再"合并知眸全部app目标点集"
+    │   for each (知眸命中行):
+    │       zCenters = 该行自己的 targets_json 解析（不再合并其它行!）
+    │       vs 自有模型全部 sCenters (bbox中心点) 一一比距离 <50px
+    │       matched = 匹配成功的点数
+    │       判定:  zt==0           → clean=1 (正常)
+    │          OR (matched>0 AND matched==zt) → clean=2 (误识别)
+    │          OR (matched>=5 AND matched*2 >= zt) → clean=2 (误识别, 匹配数≥5 且匹配率≥50%)
+    │          ELSE               → clean=1 (正常, 有落单目标需告警)
+    │       updateById(该行)   ← 各行 clean_status / clean_remark 独立写!
+    │   自有模型行: 知眸任一行 clean=1 → 自有行 clean=1
+    │
     ↓
-两侧到齐 → 清洗 clean_status=1
-    ↓
-照片告警页 ← /image-results/page（固定查二期表）
-             过滤 hit_count > 0
-             图片 = annotated_local_path 优先，原图兜底
+admin 照片告警 /photo-alarm ← GET /image-results/page
+    过滤条件: clean_status = 1 (**只显示真实告警, clean=2误识别不显示!**)
+              AND hit_count > 0
+    图片URL:  annotated_local_path → /image-detect-img/<path>（该app自己的标注图带框）
+    【今日发现bug】之前写成 ne(clean_status,0) → 误识别行(clean=2)也全显示, 必须 eq(1)
+
+screen 大屏警情(imgae模式) ← GET /alerts (LIMIT 50)
+    过滤条件: 同上 clean_status=1 AND hit_count>0
+    图片URL: 同上（带框标注图）
+    【轮询决策】飞行中 1 秒刷新; 待机停止（基于 device.modeCode 判定）
 
 --------------------------------------------------------------------------------
-四、目录解耦（物理隔离）
+四、目录解耦（物理隔离）—— 实施后纠正版
 --------------------------------------------------------------------------------
 
-zhimou-images/{yyyyMMdd}/                     ← 一期视频专用（不再混入二期文件）
+zhimou-images/{yyyyMMdd}/                     ← 一期视频专用【只读不写二期数据】
 └── 1788151503385_0c0800d3.png                （直播标注图，存量保留）
+                                                一期不再出现 DJI_*.jpeg 照片原图
 
-zhimou-image-detect/                          ← 二期照片专用【新增根目录】
+zhimou-image-detect/                          ← 二期照片专用【所有二期文件都在这里】
 └── {yyyyMMdd}/
-    └── {taskUuid}/                           ← 一个架次一个文件夹
-        ├── original/                         ← MinIO 原图
+    └── {taskUuid}/                           ← 一个架次一个文件夹（taskUuid是MinIO fh_sync路径里的uuid）
+        ├── original/                         ← MinIO 原图（知眸暂存图 + 自有模型原图都放这里）
         │   └── DJI_20260831124402_0013_V.jpeg
         └── annotated/                        ← 知眸标注图（命中才落盘）
-            └── DJI_20260831124402_0013_V.png
+            ├── DJI_20260831124402_0013_V_{appId1}.jpg   （小客车识别标注图, JPEG）
+            └── DJI_20260831124402_0013_V_{appId2}.jpg   （人员识别标注图, JPEG）
+
+【纠正】标注图直接存JPEG（知眸原始格式）, 不强制转PNG。
+        原设计转PNG导致 5280×3956 的图从10MB胀到 26~58MB（5~6倍膨胀），
+        前端 el-image 加载过大 → 页面卡顿转圈。改回 JPEG 直接落盘。
+
+【纠正】上传知眸前的本地暂存图（MinIO下载的照片原图）也放 annotated/ 的父级目录下的
+        original/，不再写一期 zhimou-images/，真正做到物理隔离。
+        对应 uploadOneImageToZhimou 里 buildImageSavePath 改到二期目录。
+
+静态映射:
+  /zhimou-img/**         → zhimou-images/          （一期不变）
+  /image-detect-img/**   → zhimou-image-detect/    （二期新增, photoAlarm和screen都用它）
 
 --------------------------------------------------------------------------------
-五、数据库变更
+五、数据库变更（实施后纠正）
 --------------------------------------------------------------------------------
 
 ALTER TABLE zhimou_image_detection
-  ADD COLUMN annotated_local_path VARCHAR(255) DEFAULT NULL
-    COMMENT '知眸标注图本地相对路径 (20260831/{taskUuid}/annotated/xxx.png)';
-  ADD COLUMN work_order_id BIGINT DEFAULT NULL
-    COMMENT '工单ID(NULL=未处理,与一期语义一致)';
+  ADD COLUMN annotated_local_path VARCHAR(512) DEFAULT NULL    【纠正→512, 非255】
+    COMMENT '知眸标注图本地相对路径: {date}/{taskUuid}/annotated/{baseName}_{appId}.jpg';
+    【实施前初始设计写255, 后因短暂的多路径逗号拼接方案扩到512;
+     虽然后来又改回单路径, 保留512无副作用不再收缩】
 
-历史数据清理（不做迁移，直接删除）:
+  ADD COLUMN work_order_id BIGINT DEFAULT NULL
+    COMMENT '工单ID(NULL=未处理, 与一期一致, 照片告警handle按钮写)';
+
+  ADD COLUMN raw_callback_json LONGTEXT DEFAULT NULL
+    COMMENT '知眸回调完整原始JSON(Jackson toString, 不要用hutool序列化JsonNode会丢键!)';
+    【补充】初始漏加, 今日排查"同图两结果"时想用历史回调原文, 发现之前用 hutool 的
+    JSONUtil.toJsonStr(JsonNode) 存进去的是空数组嵌套, 所有键名丢失。
+    修正: Jackson ObjectMapper.writeValueAsString(body) 直接写。
+
+历史数据清理（实施当日已做）:
   TRUNCATE TABLE zhimou_image_detection;
   TRUNCATE TABLE self_model_image_detection;
-  文件: 删除 zhimou-images/*/DJI_*.jpeg，保留 1788*.png（一期标注图）
+  文件: 删除一期 zhimou-images/*/DJI_*.jpeg, 保留 1788*.png（一期直播标注图）。
+  二期 zhimou-image-detect/ 新建, 初始为空。
+
+清洗结果字段说明（一结果一行模型下的语义）:
+  zhimou_image_detection.clean_status
+    0 = 未清洗/等待自有模型回调（无目标hit=0的历史残留行永远是0, 不影响）
+    1 = 正常, 保留告警, admin照片告警 & screen image模式 显示
+    2 = 误识别, 【不再显示!】 eq(clean_status,1) 过滤
+  clean_remark 格式:
+    "误识别:知眸N个目标匹配M个,匹配率%%达阈值"
+    "误识别:知眸N个目标全部匹配自有模型"
+    "正常:知眸N个目标中M个匹配自有模型"
+    "自有模型无有效结果, 判定正常"
+  末尾自动加 "[重算]" 标记是用脚本从历史数据回填产生的, 实飞写入不带此标记。
 
 --------------------------------------------------------------------------------
-六、后端改动（6 处）
+六、后端改动（实施后实际 11 处, 含今日纠正）
 --------------------------------------------------------------------------------
 
-1. ZhimouTaskServiceImpl.handleImageCallback
-   apps[0].image 非空时: 拼知眸 baseUrl 下载 → convertToPngBytes 转 PNG
-   → 存 annotated/ → 写 annotated_local_path；失败只 warn 不阻塞入库。
+【A. 目录&资源】
+1. ZhimouProperties.ImageConfig
+   新增 detectRootDir = "zhimou-image-detect"（二期根目录）。
 
-2. SelfModelDetectService (原 L90-L98)
-   原图落盘路径改为 zhimou-image-detect/{date}/{taskUuid}/original/
-   （taskUuid 从 localImageName 前缀取，阶段3格式为 {taskUuid}/{fileName}）。
+2. ZhimouWebMvcConfig
+   新增静态映射: /image-detect-img/** → file:<detectRootDir>/（启动时自动创建目录）。
 
-3. ZhimouController 旧 GET /results/page
-   删除 alert_data_source 开关判断，固定走一期 pageResults。
+3. SelfModelDetectService.detect()
+   原图落盘 zhimou-image-detect/{date}/{taskUuid}/original/（从一期 saveRootDir 迁出）。
 
-4. ZhimouController 新增 GET /image-results/page
-   固定查二期表；条件 clean_status!=0 AND hit_count>0；
-   支持 status(handled/unhandled 按 work_order_id)、aircraft_sn、时间筛选、分页。
+4. ZhimouTaskServiceImpl.uploadOneImageToZhimou()
+   buildImageSavePath 改到二期 original/ 目录, 实现暂存图物理隔离,
+   Redis meta.local_image_path 同步改。
 
-5. ZhimouController 新增 PUT /image-results/{id}/handle
-   标记已处理（写 work_order_id），照片告警页"处理"按钮用。
+【B. 知眸识别链路】
+5. ZhimouOpenApiClient.reportImage()
+   URL 追加 &enhance=1，开启高分辨率图片(>2K)小目标增强识别。
+   5280×3956 的航拍照片必须开，否则小目标漏检严重。
 
-6. ZhimouWebMvcConfig
-   新增静态映射: zhimou-image-detect/ → /image-detect-img/**
+6. ZhimouTaskServiceImpl.handleImageCallback()【大改 3 次后定版】
+   (a) apps 循环: 每 app 命中→插 1 行（一结果一行，不再合并拼接）
+   (b) 每行的 targets_json 只保留当前 app 的 objects（独立可重算）
+   (c) 每行独立下载该 app 的标注图 JPEG（直接写 byte[]，不转 PNG）
+       文件名 {baseName}_{appId}.jpg，防止同图不同 app 覆盖
+   (d) annotated_local_path 单路径（不再逗号拼接）
+   (e) raw_callback_json 用 Jackson.writeValueAsString(body) 完整存（别用hutool）
+   (f) 全部插完 → zhimou=1 → triggerImageCleanupIfReady
 
-buildImageResultVO 的 URL 逻辑:
-  image_http_url = annotated_local_path 非空
-      ? "/image-detect-img/" + annotated_local_path     // 知眸标注图（带框）
-      : "/image-detect-img/" + localImagePath;          // 兜底原图
+【C. 清洗链路】
+7. ImageCleanupService.cleanupSingleImage()【大改 2 次后定版】
+   (a) 聚合知眸所有命中行，但不再合并 targets_json
+   (b) 对每行知眸命中行：
+       zCenters = 该行自己的 targets_json 解析
+       vs 自有模型全部 bbox 中心点 (50px 半径匹配)
+       独立计算 matched 和 clean_status，独立写 clean_remark
+       updateById(该行) ← 关键：各行单独写，允许同一图一行clean=2另一行clean=1
+   (c) 判定公式：
+       全匹配 (matched==zt>0)             → clean=2 误识别
+       或 匹配≥5 且 匹配率≥50% (m*2≥zt)   → clean=2 误识别
+       其余(落单存在 / 自有无结果 / 匹配不够) → clean=1 正常保留
+   (d) 自有模型行：知眸任一行 clean=1 → 自有clean=1；全部clean=2才clean=2
+   (e) 匹配计算用整数乘法防浮点误差 (matched*2>=zt 代替 matched/zt>=0.5)
 
---------------------------------------------------------------------------------
-七、前端改动（4 处）
---------------------------------------------------------------------------------
+【D. 接口 & 显示口径】
+8. ZhimouController：旧 GET /results/page
+   删除 alert_data_source 开关判断，固定查一期 zhimou_detection_result。
 
-1. admin-v3 src/router/index.ts
-   新增路由 /photo-alarm → views/photoAlarm/index.vue
+9. ZhimouController：新增 GET /image-results/page + PUT /image-results/{id}/handle
+   page: 固定查二期 zhimou_image_detection；
+   ★过滤条件: clean_status = 1 AND hit_count > 0
+   【今日bug修复】之前写的 ne(clean_status,0) → clean=2 误识别行也被放出来了！
+   handle: 写 work_order_id = System.currentTimeMillis()
 
-2. admin-v3 src/layout/index.vue
-   新增菜单项"照片告警"（Camera 图标，排在告警管理下方）
+10. ZhimouController：buildImageResultVO()
+    annotated_local_path 前缀判 /image-detect-img/；
+    一期手动测试用的本地相对路径（无 taskUuid 斜杠）走 /zhimou-img/；
+    标注图 URL 是当前行该 app 自己的带框图。
 
-3. admin-v3 src/views/photoAlarm/index.vue【新文件】
-   复制 alarm/index.vue: 接口改 /image-results/page，
-   处理按钮调 PUT /image-results/{id}/handle，
-   列微调（增加 hit_count 识别目标数列）。
-
-4. admin-v3 src/views/data-source/index.vue
-   "警情数据源"标签改为"大屏警情数据源"，
-   描述改为"仅控制大屏警情模块的数据源；admin 的告警管理/照片告警页面不受影响"。
-
---------------------------------------------------------------------------------
-八、边界与兜底
---------------------------------------------------------------------------------
-
-| 场景                          | 行为                                       |
-|-------------------------------|--------------------------------------------|
-| 知眸标注图下载失败/超时        | annotated_local_path=NULL, 显示原图, warn  |
-| hit_count>0 但回调无 image    | 异常数据, 显示原图兜底 + warn              |
-| 一期/二期文件同名冲突         | 物理目录隔离, 不存在冲突                   |
-| 大屏接口 ApiController#L582   | 零改动, 继续读 alert_data_source           |
-| 无目标照片(hit=0)             | 不进入照片告警列表                         |
-
---------------------------------------------------------------------------------
-九、实施顺序
---------------------------------------------------------------------------------
-
-1. DB: ALTER 加字段 + TRUNCATE 清理 + 删 DJI 原图文件
-2. 后端: 目录解耦（改动1、2）
-3. 后端: 接口（改动3、4、5、6）
-4. 前端: 照片告警页 + 菜单 + 文案（改动1~4）
-5. 编译重启 + 飞行验证:
-   ├── 照片告警页显示知眸标注图（带框）
-   ├── 告警管理页仍显示直播标注图（回归）
-   ├── 大屏跟随开关切换（回归）
-   └── 无目标照片不出现在照片告警列表
-6. git 提交
+11. ApiController /alerts (imageMode=true)
+    同口径 clean_status = 1 AND hit_count > 0；
+    图片URL 与 buildImageResultVO 一致（标注图优先, 兜底原图）；
+    LIMIT 50 保留（大屏只取最近 50 条，设计如此）。
 
 --------------------------------------------------------------------------------
-十、关联背景（本次排查过程要点, 供后续参考）
+七、前端改动（实施后实际 6 处, 含今日实飞纠正）
+--------------------------------------------------------------------------------
+
+admin-v3:
+  1. src/router/index.ts
+     新增路由 /photo-alarm → views/photoAlarm/index.vue
+     元信息 title="照片告警", icon=Camera
+
+  2. src/layout/index.vue
+     新增菜单项"照片告警"（Camera 图标，排在"告警管理"正下方），
+     权限与"告警管理"同级。
+
+  3. src/views/photoAlarm/index.vue【新文件】
+     - 列: ID | 告警类型(app_name单值) | 飞机SN | 飞机名称 | 标注图 | 航线名称
+         | 识别目标数(hit_count) | 识别时间 | 处理状态 | 操作
+     - 接口: GET /image-results/page + PUT /image-results/{id}/handle
+     - 大图预览: 单图 (el-image preview-src-list 长度1)
+       【今日纠正删除多余代码】之前短暂加入的"多app标注图切换器"是错的，
+       因为现在一结果一行，每行就一张该app的标注图，根本不需要切换器。
+     - 加载策略: onMounted 即 load()（不要手动刷新才加载）
+       ※此页不做轮询（照片识别不是实时直播, 清洗链路1~5分钟后才出结果）
+
+  4. src/views/data-source/index.vue
+     "警情数据源"文案 → "大屏警情数据源"
+     帮助提示文案改为"仅控制大屏警情模块的数据源；admin的告警管理/照片告警
+     页固定各自数据源不受影响"
+
+  5. src/views/alarm/index.vue【今日新增】
+     - 每 1 秒 tick 一次：检查 store 里 device 的 modeCode
+       （不是 0 且不是 14 视为飞行中）
+     - 飞行中：静默刷新列表（不传 loading，不弹遮罩；保留当前分页和搜索条件）
+     - 待机：不发 /results/page 请求（省掉无效请求）
+     - 手动"刷新"按钮照常可用。
+     原因: 视频识别在飞行时秒级入库, 原页面只在 onMounted 加载一次导致
+           飞行中识别到了但页面上看不见(用户反馈)。
+
+  6. src/views/home/dangerSum.vue (screen-v3)【今日新增】
+     - 原有 2 秒轮询 → 飞行中 1 秒刷新, 待机停止
+     - 飞行状态直接复用 home 页 store.devices（2秒已维护）, 不再额外请求设备接口。
+     - 首次加载立即拉一次（待机也能看到历史数据）。
+
+  注: 两类页面刷新策略不同, 来源于用户明确的业务判断:
+       一期视频告警 = 直播流实时识别, 飞行中秒级产生 → 1秒轮询
+       二期照片告警 = 降落+上传后批量识别, 1~5分钟后才出结果 → 不轮询
+
+--------------------------------------------------------------------------------
+八、边界与兜底（实飞补充）
+--------------------------------------------------------------------------------
+
+| 场景                                   | 行为                                              |
+|----------------------------------------|---------------------------------------------------|
+| 知眸 apps[] 为空/目标为 0              | hit_count=0, 不进入照片告警列表                   |
+| 知眸 apps[N] 多 app 结果               | 每 app 插一行 clean 独立写, 允许一图 2 行状态不同 |
+| 知眸回调无 app.image 但有命中          | annotated=NULL, 前端显示原图兜底+warn日志         |
+| 知眸标注图下载超时/4xx/5xx             | annotated=NULL, 显示原图兜底(仅 warn, 不阻塞入库) |
+| 知眸标注图 URL 有效期 (~20分钟)        | 必须回调到达时【立即】下载落盘, 过期后无法补下    |
+| 知眸 app 标图非 JPEG                   | 直接写 bytes（格式随源, 不强转 PNG!）             |
+| 自有模型 targets_json 无 bbox          | 知眸每行 clean=1, 保留告警                        |
+| 自有模型识别超时                       | 知眸先入库(imgKey zhimou=1 pending), 后续继续触发 |
+| 匹配距离 50px                          | 5280 像素大图约 0.9% 宽, 同一目标中心点偏差容限  |
+| 匹配整数乘法 m*2>=z                    | 避免 Java 浮点除法精度误差                         |
+| 误识别 clean=2                         | 接口 eq(clean_status,1) 过滤, 不显示              |
+| 一期/二期文件同名冲突                  | 物理目录隔离 + 不同 URL 前缀, 不存在冲突           |
+| 大屏 LIMIT 50                          | 只取最新 50 条(图像模式), 设计如此                 |
+| 视频告警 /alarm 页面                   | 飞行中 1 秒静默刷新, 待机停止                      |
+| photoAlarm 照片告警页面                | onMounted 一次加载, 不做轮询（1~5 分钟后才出齐）  |
+| enhance=1 开启后知眸识别耗时           | 可能增加 1~3 秒/图, 正常范围                       |
+| Redis imgKey zhimou/self 重复写        | triggerImageCleanupIfReady 幂等, 写 1 即跳过      |
+| 知眸 reportImage 10s 超时              | 创建空 DB clean=1 + zhimou=1 failed=1             |
+
+--------------------------------------------------------------------------------
+九、今日 5 次实飞验证结果（2026-08-31 下午 14:09 ~ 18:19）
+--------------------------------------------------------------------------------
+
+架次统计（今日总）：MinIO 轮询 8 架次；图片识别清洗链路 7 次全部完成无卡住。
+
+架次 A: 1587858651477310800 (14:09 起飞)
+  问题: 初始版回调只取 apps[0], 5 张双命中图的第二个 app 被丢弃
+        → 15 图 20 个识别结果, DB 只有 15 行, 丢 5 行
+        → hit_count 也少算 (人员1+车10 的图只记 hit=1)
+        标注图错误: 转 PNG 体积 26~58MB (原 JPEG 5~12, 胀 5~6 倍)
+        图片暂存: 错写到一期 zhimou-images/ (目录隔离没做完)
+        接口: ne(clean_status,0) (误识别行会显示, 当时全clean=1 未暴露)
+  后续全重算修正, 但副标注图因 URL 过期无法补下载。
+
+架次 B: 158787xxxx (15:54 起飞, enhance=1 首次飞行)
+  问题: 短暂采用了"错误的类别语义过滤"方案
+        人员目标(2238,99)过滤掉汽车类自有 bbox 反过来匹配 → 人为放大距离
+        → 导致某些行匹配率偏低。虽然后续实飞没暴露但这是错误抽象。
+        发现后立即撤销: 永远不要做语义类别过滤!
+  另外发现 raw_callback_json 用 hutool 序列化丢失键名 (数组嵌套全空)
+  → 改为 Jackson.writeValueAsString(body) 之后架次正常带键。
+
+架次 C: 1587896221171055952 (用户换新自有模型后首次飞行, ~17:12)
+  本架次重要观察:
+    - 新模型类别与知眸不完全对齐 (新模型有停车标志, 没有人员)
+    - 自有在 5 张图无结果 (可能模型推理异常 / 尺寸不匹配)
+    - 匹配整体偏低, 仅 0001_V 12/10 (83%) 触发 Bulk 阈值 clean=2
+    - 其余图匹配率 0~30%, 全部 clean=1 保留告警
+  结论: 模型对齐度决定误识别率; Bulk 阈值(≥5 且≥50%)效果符合预期,
+        0001_V 小客车识别隐藏, 人员识别保留, 符合一结果一行语义。
+
+架次 D: 158790xxxx (~17:5x)
+  - 清洗链路 OK, 29 行新识别
+  - 仍有 ~13 行 hit=0 / local_image_name=NULL (无目标回调不参与清洗,
+    历史遗留, 永远 clean=0, 不显示 不影响 可保留不删)
+
+架次 E: 1587912981127494992 (~18:19 降落)
+  ★最终版 (逐行独立+无类别过滤+JPEG+enhance=1+目录解耦+eq(1))
+  验证全通过:
+    知眸总行=20, 命中=18, 标注图=18 (1:1 落盘, 全JPEG无降级)
+    双命中图=3, 各行独立算 clean (巧合地都是 clean=1)
+    剔除=2行:
+      id=189 DJI_181515_0001_V 小客车识别 (11→10匹配, 91% → clean=2 Bulk阈值)
+      id=194 DJI_181556_0006_V 小客车识别 (1→1匹配, 100% → clean=2 全匹配)
+    保留显示=16行, 与 admin照片告警 total=16 完全对得上 ✅
+    photo=alerts=16 (clean=2 两行都被 eq(1) 正确过滤)
+    自有模型行 clean 结果与知眸一致 (任一行保留=1, 全误识别=2)
+    imgKeys=0, 批次key全部 COMPLETED (清洗全链路完成, 零卡住)
+
+--------------------------------------------------------------------------------
+十、已踩的坑（供后续参考, 绝对不要再犯）
+--------------------------------------------------------------------------------
+
+坑1: 一图一行（合并点集）写统一 clean_status → 丢掉了一图内多种app
+     结果各自的识别结果, 同图小客车和人员永远一起显/隐 → 错。
+     → 最终方案: 一结果一行, 逐行独立 clean。
+
+坑2: 类别语义过滤（人员知眸目标只在自有人员bbox里找匹配, 汽车目标
+     只在汽车 bbox 里找）→ 典型的"测试数据抽象过度"。航拍中类别名字符
+     串在不同模型/不同版本/不同语言下完全不对齐 (人员/person/人/0/小汽车/
+     小客车/汽车/car/vehicle) 匹配结果随机; 而且"自有模型没训人员类"是正
+     常业务, 过滤反而导致知眸人员永远在自有里找不到匹配(人为放大距离)。
+     → 最终方案: 永远【不用类别过滤】, 行自己的所有目标 vs 自有全部
+       bbox 中心点逐一比 50px, 最近的匹配。简单、正确、不依赖字符串。
+
+坑3: ne(clean_status,0) 显示所有"洗过的"行 → clean=2 误识别行也放出来
+     → 违反"误识别=剔除不告警"的基本语义。
+     → 最终方案: 4 处接口 (ZhimouController×3 + ApiController image) 全
+       改 eq(clean_status,1), 只显示真实告警。
+
+坑4: 强制把知眸标注图从 JPEG 转 PNG → 体积胀 5~6 倍。5280×3956 的图单
+     张 58MB, 前端 el-image 加载转圈卡死, 页面感知"数据不对"。
+     → 最终方案: 直接写知眸原始 byte[] (通常 JPEG), 不做任何格式转换。
+
+坑5: hutool JSONUtil.toJsonStr(Jackson JsonNode) → 序列化为空数组嵌套,
+     键名全丢, raw_callback_json 等于白存, 想翻历史原始回调时完全没数
+     据可用。
+     → 最终方案: 用 Jackson ObjectMapper.writeValueAsString(body), 保持原
+       始结构完整。
+
+坑6: 知眸回调标注图 URL 有 ~20 分钟有效期。如果不回调到达时立即落盘,
+     想回溯时 404 无法补下载 → 千万不要延后下载。
+
+坑7: 临时脚本 / 调试脚本留在项目根目录 (check_*, monitor_*, backfill_*,
+     verify_* 等) 且不加入 git, 造成工作区 40+ 个杂乱文件, 容易混淆
+     正式源码。
+     → 用完立即删除; 确有长期价值的移到 scripts/ 子目录。
+
+--------------------------------------------------------------------------------
+十一、关联背景（本次排查过程要点, 供后续参考）
 --------------------------------------------------------------------------------
 
 1. 验证方法: 直接读取 zhimou-images/20260831/1788151503385_0c0800d3.png 确认
@@ -173,10 +396,32 @@ buildImageResultVO 的 URL 逻辑:
 
 3. 知眸回调字段:
    data.frame.image        = 知眸原始帧图相对URL（/openapi/{taskId}/images/xxx.jpg）
-   data.apps[0].image      = 知眸app标注图相对URL（/openapi/{taskId}/messages/{appId}/xxx.jpg）
-   二者均为知眸服务器上的相对路径, 需拼 openapi.baseUrl 下载。
+   data.apps[N].image      = 知眸每个app独立的标注图URL
+                             （/openapi/{taskId}/messages/{appId}/xxx.jpg）
+   data.apps[N].objects[]  = 该 app 的检测目标列表: { x, y, name, color ... }
+                             ★只有 x,y 是点坐标, 没有宽高, 不能画矩形框!
+                             只能做 50px 中心点匹配。
+   apps[].image 在各 app 里各自独立 → 一结果一行的物理基础
+   所有路径都是知眸服务器的相对路径, 需拼 openapi.baseUrl 下载。
+   ★ 标注图 URL 有效期约 20 分钟 → 回调到达必须立即落盘, 过期无法补。
 
 4. 一期告警状态机制: zhimou_detection_result.work_order_id NULL=未处理,
-   非空=已处理; 前端按此显示处理状态并筛选。
+   非空=已处理; 前端按此显示处理状态并筛选。二期沿用完全相同语义。
+
+5. 自有模型 targets_json 格式 (与知眸格式不同, 不要混淆!)
+   [ { class_name: "汽车", confidence: 0.98,
+       bbox: { x1, y1, x2, y2 }   ← 矩形左上右下, 中心点((x1+x2)/2,(y1+y2)/2) 参与匹配
+     }, ... ]
+   没有 name/x/y 结构, 是 class_name/bbox。清洗时统一转为 (cx, cy) 点集 vs
+   知眸 (x, y) 点集比距离。
+
+6. 飞行状态判定: 设备的 modeCode
+   0=待机, 14=未连接, 3~9=各类飞行模式
+   告警轮询判定飞行: modeCode != 0 且 modeCode != 14
+
+7. 清洗的本质（一句话）:
+   知眸识别出的"每个目标点"都要在自有模型的同一图中找到 50px 内的对应框，
+   找不到 → 说明两系统对该目标没有一致共识，把这行结果保留为真实告警；
+   都能找到 或 大量能找到 → 说明是共同场景的共识目标，当作误识别剔除。
 
 ================================================================================

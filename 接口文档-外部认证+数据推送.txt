@@ -1,0 +1,437 @@
+================================================================================
+          接口文档 - 外部认证 + 数据推送
+================================================================================
+文档日期: 2026-09-01
+适用版本: sikong-cloud-api 1.0.0 (二期图片识别阶段2)
+状态: 已实施 + 已验证 (2026-09-01)
+
+本系统服务地址: http://192.168.2.130:8080/api
+本系统后端语言: Spring Boot 2.7 / JDK 17
+配置文件: src/main/resources/application-company-a.yml
+
+本文档供父系统对接使用，包含两个独立功能：
+  功能1: 外部系统通过 API Key 换取 Token 调用本系统接口（父系统 → 本系统）
+  功能2: 本系统清洗后向父系统推送识别告警数据（本系统 → 父系统）
+
+两个功能完全独立，互不依赖，可单独对接。
+
+================================================================================
+功能1: 外部系统 API Key 换取 Token 认证
+================================================================================
+
+--------------------------------------------------------------------------------
+1.1 背景
+--------------------------------------------------------------------------------
+本系统是父系统的子项目。父系统需要通过 token 调用本系统受保护接口。
+不使用 JWT，复用现有 Redis token 机制（与前端登录 token 同一存储）。
+
+--------------------------------------------------------------------------------
+1.2 认证流程
+--------------------------------------------------------------------------------
+  父系统
+    │
+    │  ① POST /api/auth/api-key-login
+    │     Headers: X-API-Key, X-API-Secret
+    │  ──────────────────────────────►  本系统
+    │                                      │ 校验 key/secret
+    │                                      │ 生成 UUID token
+    │                                      │ 存入 Redis (TTL 24h)
+    │   ② 返回 { token, username, name, expiresIn } ◄──────
+    │
+    │  ③ 用 token 调本系统任意接口
+    │     GET/POST /api/xxx?token=xxx
+    │  ──────────────────────────────►  本系统
+    │                                      │ Redis 查 token
+    │                                      │ 滑动续期 24h
+    │   ④ 返回业务数据 ◄──────────────────────
+    │
+    │  (token 过期，收到 401)
+    │  ⑤ 自动重新执行 ① 换新 token
+    │  ⑥ 用新 token 重发原请求
+
+--------------------------------------------------------------------------------
+1.3 换取 Token 接口
+--------------------------------------------------------------------------------
+接口名称: API Key 换取 Token
+请求方式: POST
+请求路径: /api/auth/api-key-login
+Content-Type: application/json (请求体可空)
+
+请求头 (Headers):
+  X-API-Key:    {API Key}     必填，配置在 application-company-a.yml 的 external-auth.api-key
+  X-API-Secret: {API Secret}  必填，配置在 external-auth.api-secret
+
+默认凭据（可改）:
+  api-key:    zhoudao-parent-key
+  api-secret: a8f3b2c1d9e7f0a5
+
+请求体: 可空（POST 无 body 即可）
+
+响应 (HTTP 恒为 200, application/json):
+  注意: 本系统所有失败场景 HTTP 状态码均为 200, 失败信息放在响应体 code 字段
+  父系统必须解析响应体 code 判断成功失败, 不要按 HTTP 状态码判断
+
+成功:
+{
+  "code": 200,
+  "msg": "success",
+  "data": {
+    "token": "78eba9ccbfd94156ab8b1234567890ab",
+    "username": "external-system",
+    "name": "外部系统",
+    "expiresIn": 86400
+  },
+  "success": true
+}
+
+失败 (key/secret 错误):
+{
+  "code": 401,
+  "msg": "API Key或Secret错误",
+  "data": null,
+  "success": false
+}
+
+失败 (未配置):
+{
+  "code": 500,
+  "msg": "API Key认证未配置",
+  "data": null,
+  "success": false
+}
+
+字段说明:
+  token     - 32位 UUID（无横线），后续调本系统接口用
+  username  - 固定 "external-system"
+  name      - 固定 "外部系统"
+  expiresIn - token 有效期秒数（86400 = 24小时）
+
+--------------------------------------------------------------------------------
+1.4 Token 验证接口（可选，用于父系统启动时自检）
+--------------------------------------------------------------------------------
+请求方式: GET
+请求路径: /api/auth/verify?token={token}
+
+响应 (成功):
+{
+  "code": 200,
+  "msg": "success",
+  "data": {
+    "id": 0,
+    "username": "external-system",
+    "name": "外部系统",
+    "dept": "信息中心"
+  }
+}
+
+响应 (token 过期/无效):
+{
+  "code": 401,
+  "msg": "登录已过期，请重新登录"
+}
+
+权限说明:
+  外部系统 token 自动拥有 hasAdminAccess=true，
+  可访问本系统管理后台（admin-v3）所有接口。
+  滑动续期: 每次 verify 成功，TTL 重置为 24 小时。
+
+--------------------------------------------------------------------------------
+1.5 Token 过期处理（父系统侧实现建议）
+--------------------------------------------------------------------------------
+推荐方式: 过期重换
+伪代码:
+  function callSikongApi(url, params):
+      resp = http(url + "?token=" + cachedToken)
+      if resp.code == 401:                          # token 过期
+          cachedToken = apiKeyLogin()                # 重新换 token
+          saveToken(cachedToken)                     # 缓存新 token
+          resp = http(url + "?token=" + cachedToken) # 用新 token 重发
+      return resp
+
+  function apiKeyLogin():
+      resp = httpPost("/api/auth/api-key-login", headers={
+          "X-API-Key":    "zhoudao-parent-key",
+          "X-API-Secret": "a8f3b2c1d9e7f0a5"
+      })
+      return resp.data.token
+
+--------------------------------------------------------------------------------
+1.6 测试命令 (PowerShell)
+--------------------------------------------------------------------------------
+# 1. 换取 token
+$headers = @{
+    "X-API-Key"    = "zhoudao-parent-key"
+    "X-API-Secret" = "a8f3b2c1d9e7f0a5"
+}
+$resp = Invoke-WebRequest -Uri "http://192.168.2.130:8080/api/auth/api-key-login" `
+    -Method POST -Headers $headers -UseBasicParsing
+$resp.Content
+# 期望: {"code":200,...,"token":"xxx",...}
+
+# 2. 验证 token
+$token = ($resp.Content | ConvertFrom-Json).data.token
+Invoke-WebRequest -Uri "http://192.168.2.130:8080/api/auth/verify?token=$token" `
+    -Method GET -UseBasicParsing | Select-Object StatusCode, Content
+# 期望: {"code":200,...,"name":"外部系统",...}
+
+# 3. 错误 key 测试
+# 注意: 本系统失败场景 HTTP 状态码恒为 200, 错误信息放在响应体 code 字段
+# 不要用 try/catch 捕获 HTTP 异常, 应解析响应体 code 字段判断成功失败
+$resp = Invoke-WebRequest -Uri "http://192.168.2.130:8080/api/auth/api-key-login" `
+    -Method POST -Headers @{"X-API-Key"="wrong";"X-API-Secret"="wrong"} `
+    -UseBasicParsing
+$resp.StatusCode     # 200 (HTTP 恒为 200)
+$resp.Content        # {"code":401,"msg":"API Key或Secret错误"}
+# 判断成功失败: 解析响应体 code 字段, 200 才算成功
+($resp.Content | ConvertFrom-Json).code   # 401
+
+--------------------------------------------------------------------------------
+1.7 配置（application-company-a.yml）
+--------------------------------------------------------------------------------
+external-auth:
+  api-key: "zhoudao-parent-key"      # 可改，父系统需同步
+  api-secret: "a8f3b2c1d9e7f0a5"     # 可改，父系统需同步
+  token-ttl: 86400                    # token 有效期秒数（默认 24 小时）
+
+修改后需重启后端生效。
+
+================================================================================
+功能2: 清洗后异步推送识别告警数据到外部接口
+================================================================================
+
+--------------------------------------------------------------------------------
+2.1 背景
+--------------------------------------------------------------------------------
+知眸图片识别结果清洗完成后，本系统主动向父系统 POST 推送告警数据。
+推送数据包含经纬度、高度、应用名、标注图访问 URL 等。
+
+推送方向: 本系统 ──► 父系统接收接口
+推送方式: 异步并行（每条独立线程，互不等待）
+内网环境，无需鉴权头（如需，可扩展 push 配置加 auth-header）
+
+--------------------------------------------------------------------------------
+2.2 推送时机
+--------------------------------------------------------------------------------
+触发: ImageCleanupService 清洗完成，写入 clean_status 后
+过滤: 只推 clean_status = 1 (真实告警)
+       不推 clean_status = 2 (误识别)
+       不推 clean_status = 0 (未清洗/无目标)
+开关: push.enabled = true 时才推 (yml 配置)
+
+--------------------------------------------------------------------------------
+2.3 推送数据格式（父系统需实现的接收接口）
+--------------------------------------------------------------------------------
+接收接口要求:
+  请求方式: POST
+  Content-Type: application/json
+  超时: 3 秒（本系统侧配置，父系统应 < 3 秒返回）
+  无鉴权头（内网信任）
+
+确认机制 (confirm-mode: code0):
+  父系统返回 HTTP 200 + {"code":0,"message":"ok"}  → 推送成功
+  父系统返回非 200 / 超时 / 响应体不含 code:0        → 进入重试
+
+确认机制 (confirm-mode: http200, 降级模式):
+  父系统返回 HTTP 200 即视为成功
+
+推送数据 (JSON Body):
+{
+  "aircraft_sn": "1581F8HGX252F00A018X",              # 飞机SN
+  "task_id": "1587912981127494992",                   # 知眸任务ID
+  "image_name": "20e8c0db-86c4-4015-b983-6dfbbb011e5c/DJI_20260831181515_0001_V",  # 本地图片名(含UUID目录前缀, 清洗关联键)
+  "latitude": 32.0602550,                             # 纬度(最多7位小数)
+  "longitude": 118.796877,                            # 经度
+  "altitude": 85.5,                                   # 高度(米)
+  "app_name": "小客车识别",                            # 知眸应用名
+  "hit_count": 10,                                    # 识别目标数
+  "clean_status": 1,                                  # 1=真实告警(固定)
+  "clean_remark": "正常:知眸11个目标中10个匹配自有模型", # 清洗说明
+  "annotated_image_url": "http://192.168.2.130:8080/api/image-detect-img/20260831/xxx/annotated/DJI_xxx.jpg",
+  "detect_time": "2026-08-31 17:12:42"                # 识别时间
+}
+
+字段说明:
+  aircraft_sn        - 飞机设备SN
+  task_id           - 知眸任务ID (字符串)
+  image_name        - 图片本地文件名, 含UUID目录前缀 (如 20e8c0db-.../DJI_xxx_V)
+                      说明: 该前缀是本系统数据清洗关联键, 父系统按 opaque 字符串存储即可,
+                      请勿按 "/" 拆分或截取, 直接整串用于关联/去重
+  latitude          - 纬度 (BigDecimal, 最多7位小数, 精度约0.01米)
+  longitude         - 经度 (BigDecimal, 最多7位小数, 精度约0.01米)
+  altitude          - 相对高度 (米)
+  app_name          - 知眸应用名 (小客车识别/人员识别等)
+  hit_count         - 命中目标数 (整数)
+  clean_status      - 固定 1 (推送的都是真实告警)
+  clean_remark      - 清洗结果描述
+  annotated_image_url - 标注图访问URL (带检测框的图片)
+                       格式: http://{host}:{port}/api/image-detect-img/{path}
+                       父系统可直接 GET 访问该 URL 查看带框图片
+  detect_time       - 识别时间 (yyyy-MM-dd HH:mm:ss)
+
+注意:
+  - detect_time 是字符串格式 "yyyy-MM-dd HH:mm:ss", 不是毫秒时间戳
+  - 同一张图片可能有多个识别结果（如汽车+人员），会分多条推送
+  - 一批 15 张图清洗后可能产生多条 clean_status=1 记录，并行推送
+  - annotated_image_url 可能为 null (无标注图时)
+
+--------------------------------------------------------------------------------
+2.4 父系统接收接口实现示例（参考）
+--------------------------------------------------------------------------------
+Spring Boot 示例:
+  @PostMapping("/api/receive")
+  public Map<String, Object> receive(@RequestBody Map<String, Object> payload) {
+      // 1. 解析 payload
+      String sn = (String) payload.get("aircraft_sn");
+      String taskId = (String) payload.get("task_id");
+      String imageName = (String) payload.get("image_name");
+      BigDecimal lat = new BigDecimal(payload.get("latitude").toString());
+      BigDecimal lng = new BigDecimal(payload.get("longitude").toString());
+      BigDecimal alt = new BigDecimal(payload.get("altitude").toString());
+      String annotatedUrl = (String) payload.get("annotated_image_url");
+      // 2. 入库 / 业务处理
+      // 3. 返回确认 (code:0)
+      Map<String, Object> resp = new HashMap<>();
+      resp.put("code", 0);
+      resp.put("message", "ok");
+      return resp;
+  }
+
+Python Flask 示例:
+  @app.route('/api/receive', methods=['POST'])
+  def receive():
+      payload = request.get_json()
+      sn = payload.get('aircraft_sn')
+      task_id = payload.get('task_id')
+      # ...入库处理
+      return jsonify({"code": 0, "message": "ok"})
+
+Node.js Express 示例:
+  app.post('/api/receive', (req, res) => {
+      const payload = req.body;
+      // ...入库处理
+      res.json({ code: 0, message: 'ok' });
+  });
+
+--------------------------------------------------------------------------------
+2.5 重试机制
+--------------------------------------------------------------------------------
+本系统侧重试逻辑:
+  超时时间: 3 秒 (push.timeout, 单次请求)
+  最大推送: 3 次 (push.max-retries)
+  重试间隔:
+    第1次失败 → 等 3 秒 → 第2次推送
+    第2次失败 → 等 5 秒 → 第3次推送
+    第3次失败 → 记录 ERROR 日志 (含推送 payload，方便人工补推)
+
+最坏情况时间线 (3次都失败):
+  0s    第1次推送 (3秒超时) → 失败
+  6s    第2次推送 (3秒超时) → 失败 (等3秒后发)
+  14s   第3次推送 (3秒超时) → 失败 (等5秒后发) → 记录 ERROR 日志
+  总计 17 秒兜底完毕
+
+正常情况 (第1次就成功):
+  < 100ms 完成
+
+并行推送:
+  10 条消息各自独立异步线程推送，互不等待
+  正常情况 10 条 < 1 秒全部完成
+  最坏情况 10 条 17 秒全部兜底完毕
+
+实现:
+  PushService 使用 @Async (Spring 异步) + ScheduledExecutorService (重试调度)
+  不引入 MQ，轻量级方案
+
+--------------------------------------------------------------------------------
+2.6 日志关键字（本系统侧）
+--------------------------------------------------------------------------------
+  [推送] 开始推送 id=123, sn=1581F8..., image=DJI_xxx          # 推送开始
+  [推送] 成✅ id=123, attempt=1, resp={"code":0,"message":"ok"} # 推送成功
+  [推送] 对方未确认 id=123, attempt=1, resp=xxx                 # 对方返回但未确认
+  [推送] 请求失败 id=123, attempt=1, err=Connection refused     # 网络异常
+  [推送] 3秒后重试 id=123, attempt=2                            # 准备重试
+  [推送] 5秒后重试 id=123, attempt=3                            # 准备第3次
+  [推送] 最终失败❌ id=123, 共尝试3次, payload={...}             # 最终失败
+
+排查推送问题:
+  grep "[推送]" target/springboot_start.log
+
+--------------------------------------------------------------------------------
+2.7 配置（application-company-a.yml）
+--------------------------------------------------------------------------------
+push:
+  enabled: false                                      # 推送开关 (false=不推)
+  url: "http://192.168.2.130:9090/api/receive"         # 父系统接收地址
+  timeout: 3000                                        # 单次请求超时(毫秒)
+  max-retries: 3                                       # 最大重试次数
+  retry-delays: [3000, 5000]                           # 重试间隔(毫秒) [第1次,第2次]
+  confirm-mode: "code0"                                # 确认模式 code0|http200
+
+修改后需重启后端生效。
+
+注意:
+  - enabled 默认 false，测试推送前需改为 true
+  - url 需改为父系统实际接收地址
+  - 父系统接收接口需返回 {"code":0} 确认，否则会触发重试
+
+================================================================================
+附录A: 配置文件位置
+================================================================================
+配置文件: src/main/resources/application-company-a.yml
+注意: 只修改此文件，不要改 deploy-package/ 下的副本（部署专用）。
+
+配置段落示例:
+  # 外部认证
+  external-auth:
+    api-key: "zhoudao-parent-key"
+    api-secret: "a8f3b2c1d9e7f0a5"
+    token-ttl: 86400
+
+  # 数据推送
+  push:
+    enabled: false
+    url: "http://192.168.2.130:9090/api/receive"
+    timeout: 3000
+    max-retries: 3
+    retry-delays: [3000, 5000]
+    confirm-mode: "code0"
+
+================================================================================
+附录B: 测试检查清单
+================================================================================
+[ ] 功能1: 外部认证
+    [ ] 1.1 POST /api/auth/api-key-login 正确 key → 返回 token
+    [ ] 1.2 POST /api/auth/api-key-login 错误 key → 返回 401
+    [ ] 1.3 GET  /api/auth/verify?token=xxx → 返回 name=外部系统
+    [ ] 1.4 GET  /api/auth/verify?token=无效 → 返回 401
+    [ ] 1.5 token 过期后重新换 token 成功
+
+[ ] 功能2: 数据推送
+    [ ] 2.1 push.enabled=true, url 配置正确
+    [ ] 2.2 父系统接收接口能返回 {"code":0,"message":"ok"}
+    [ ] 2.3 触发清洗后，日志出现 [推送] 开始推送
+    [ ] 2.4 日志出现 [推送] 成✅
+    [ ] 2.5 父系统能访问 annotated_image_url 查看标注图
+    [ ] 2.6 父系统关闭后，日志出现重试 + 最终失败❌
+    [ ] 2.7 push.enabled=false 时，清洗完成但无推送日志
+
+================================================================================
+附录C: 相关源码文件
+================================================================================
+功能1:
+  src/main/java/com/dji/sikong/controller/AuthController.java
+    - POST /api/auth/api-key-login (L157-L196)
+    - GET  /api/auth/verify         (L46-L83)
+
+功能2:
+  src/main/java/com/dji/sikong/service/PushService.java
+    - pushAlarmResult() 异步推送入口
+    - doPushWithRetry()  推送+重试
+    - buildPayload()     构建 payload
+    - isConfirmed()      确认判断
+
+  src/main/java/com/dji/sikong/service/ImageCleanupService.java
+    - 清洗完成 clean_status=1 时调 pushService.pushAlarmResult(z) (L159-L162)
+
+================================================================================
+文档结束
+================================================================================
