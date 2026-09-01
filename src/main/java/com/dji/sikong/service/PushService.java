@@ -66,6 +66,9 @@ public class PushService {
         if (z.getCleanStatus() == null || z.getCleanStatus() != 1) {
             return;
         }
+        if (z.getHitCount() == null || z.getHitCount() <= 0) {
+            return;
+        }
 
         Map<String, Object> payload = buildPayload(z);
         String json = JSONUtil.toJsonStr(payload);

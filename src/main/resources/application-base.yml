@@ -40,7 +40,7 @@ mybatis-plus:
   type-aliases-package: com.dji.sikong.entity
   configuration:
     map-underscore-to-camel-case: true
-    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+    log-impl: org.apache.ibatis.logging.slf4j.Slf4jImpl
   global-config:
     db-config:
       id-type: auto
@@ -58,7 +58,10 @@ logging:
     console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level --- [%15.15t] %-40.40logger{39} : %msg%n"
     file: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level --- [%15.15t] %-40.40logger{39} : %msg%n"
   level:
-    com.dji.sikong: debug
+    com.dji.sikong: info
+    com.dji.sikong.mqtt: warn
+    com.dji.sikong.mapper: warn
+    com.baomidou.mybatisplus: warn
     org.eclipse.paho: info
 
 dji:
