@@ -32,14 +32,14 @@ doc.add_heading('一、网络架构', level=1)
 
 doc.add_paragraph('部署目标服务器 192.168.2.201 有两个网卡：')
 doc.add_paragraph('  • 内网网卡：192.168.2.201', style='List Bullet')
-doc.add_paragraph('  • 外网网卡：192.168.6.201（外网 58.213.86.2 的端口映射到此网卡）', style='List Bullet')
+doc.add_paragraph('  • 外网网卡：192.168.6.201（外网 223.113.158.186 的端口映射到此网卡）', style='List Bullet')
 doc.add_paragraph('')
 
 doc.add_paragraph('网络拓扑：')
 
 # 用表格画网络拓扑
 arch_text = """
-外网 58.213.86.2
+外网 223.113.158.186
        │
        │ 端口映射
        ▼
@@ -95,7 +95,7 @@ data = [
     ['4', 'MySQL', '192.168.2.200:3306', '使用 200 服务器，需新建数据库'],
     ['5', 'SRS 流媒体', '192.168.2.201:2022', '已在 201 上运行'],
     ['6', '知眸 AI 服务', '192.168.6.35:10042', '知眸识别服务'],
-    ['7', 'MQTT 服务', '58.213.86.2:11883', 'DJI MQTT 服务'],
+    ['7', 'MQTT 服务', '223.113.158.186:11883', 'DJI MQTT 服务'],
 ]
 
 for i, row_data in enumerate(data):
@@ -378,10 +378,10 @@ p.style.font.size = Pt(10)
 
 doc.add_heading('7.4 验证外网访问', level=2)
 code14 = """# 外网访问地址
-#   监控大屏：http://58.213.86.2:63080/screen/
-#   后台管理：http://58.213.86.2:63080/admin/
-#   工单 H5：http://58.213.86.2:63080/h5/
-#   后端 API：http://58.213.86.2:63080/api/
+#   监控大屏：http://223.113.158.186:63080/screen/
+#   后台管理：http://223.113.158.186:63080/admin/
+#   工单 H5：http://223.113.158.186:63080/h5/
+#   后端 API：http://223.113.158.186:63080/api/
 """
 p = doc.add_paragraph(code14)
 p.style.font.name = 'Consolas'
@@ -445,8 +445,8 @@ config_yml_data = [
     ['知眸服务地址', '192.168.6.35:10042', '知眸 AI 识别服务'],
     ['知眸回调地址', '192.168.2.201:8080', '知眸回调到本机后端'],
     ['流媒体内网地址', '192.168.2.201:2022', 'SRS 在本机'],
-    ['流媒体外网地址', '58.213.86.2:2022', '外网访问视频流'],
-    ['H5 邮件地址', '58.213.86.2:63080', '工单邮件中的链接'],
+    ['流媒体外网地址', '223.113.158.186:2022', '外网访问视频流'],
+    ['H5 邮件地址', '223.113.158.186:63080', '工单邮件中的链接'],
 ]
 
 for i, row_data in enumerate(config_yml_data):
@@ -494,8 +494,8 @@ doc.add_paragraph('2. Redis：部署脚本会自动在本机安装 Redis', style
 doc.add_paragraph('3. 图片目录：需要把 200 服务器上的知眸图片复制到 201 的 /opt/wurenji/data/zhimou-images/', style='List Number')
 doc.add_paragraph('4. SRS 流媒体：确保 SRS 服务已正常运行（端口 2022）', style='List Number')
 doc.add_paragraph('5. 防火墙：确保 201 服务器的 8080、80、6379、2022 端口对内网开放', style='List Number')
-doc.add_paragraph('6. 外网映射：确保 58.213.86.2 的端口映射到 192.168.6.201 对应端口', style='List Number')
-doc.add_paragraph('7. MQTT：确保 58.213.86.2:11883 映射到 192.168.6.201:11883', style='List Number')
+doc.add_paragraph('6. 外网映射：确保 223.113.158.186 的端口映射到 192.168.6.201 对应端口', style='List Number')
+doc.add_paragraph('7. MQTT：确保 223.113.158.186:11883 映射到 192.168.6.201:11883', style='List Number')
 doc.add_paragraph('8. WebRTC UDP：SRS 的 WebRTC 需要 UDP 端口范围（看 SRS 配置）', style='List Number')
 
 # ============================================================

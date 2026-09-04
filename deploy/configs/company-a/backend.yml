@@ -24,13 +24,13 @@ spring:
     password: yxrogsudehnvhhad
 
 h5:
-  host: 58.213.86.2
+  host: 223.113.158.186
   port: 80
   context-path: h5
 
 dji:
   mqtt:
-    host: tcp://58.213.86.2:11883
+    host: tcp://223.113.158.186:11883
     username: zhimou_aivis
     password: aivis@zhimou
 
@@ -41,12 +41,12 @@ dji:
 
   media:
     stream-server:
-      rtmp-url: rtmp://58.213.86.2:1935/live?secret=f91c3c6060cd401b99ae649fc50a9bb6
-      pull-url-template: http://58.213.86.2:2022/live/{streamKey}.flv?secret={secret}
+      rtmp-url: rtmp://223.113.158.186:1935/live?secret=f91c3c6060cd401b99ae649fc50a9bb6
+      pull-url-template: http://223.113.158.186:2022/live/{streamKey}.flv?secret={secret}
       rtmp-url-internal: rtmp://192.168.2.201:1935/live?secret=f91c3c6060cd401b99ae649fc50a9bb6
       pull-url-template-internal: http://192.168.2.201:2022/live/{streamKey}.flv?secret={secret}
       rtmp-url-ai: rtmp://192.168.2.201:1935/live/ai/{streamKey}?secret={secret}
-      pull-url-template-ai: http://58.213.86.2:2022/live/ai/{streamKey}.flv?secret={secret}
+      pull-url-template-ai: http://223.113.158.186:2022/live/ai/{streamKey}.flv?secret={secret}
 
 zhimou:
   openapi:

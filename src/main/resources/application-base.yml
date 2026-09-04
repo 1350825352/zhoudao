@@ -59,7 +59,7 @@ logging:
     file: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level --- [%15.15t] %-40.40logger{39} : %msg%n"
   level:
     com.dji.sikong: info
-    com.dji.sikong.mqtt: warn
+    com.dji.sikong.mqtt: info
     com.dji.sikong.mapper: warn
     com.baomidou.mybatisplus: warn
     org.eclipse.paho: info
