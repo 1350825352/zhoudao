@@ -1,0 +1,286 @@
+================================================================================
+项目部署步骤 - 目标服务器: 192.168.2.201
+================================================================================
+生成时间: 2026-09-16
+项目: 石知韵智能科技 - 司空云API (sikong-cloud-api)
+================================================================================
+
+一、服务器环境要求
+--------------------------------------------------------------------------------
+- OS: Ubuntu 22.04 (ARM 或 x86_64 均可)
+- 内存: >= 2GB (推荐 4GB+)
+- 磁盘: >= 10GB 可用空间
+- 网络: 内网 192.168.2.x 可访问 192.168.2.200 (MySQL/MinIO)
+- 外网: 可访问 223.113.158.186 (MQTT/SRS 流媒体)
+
+
+二、依赖服务一览 (不在 201 上安装, 复用现有)
+--------------------------------------------------------------------------------
+| 服务      | 地址                    | 说明
+|-----------|------------------------|------------------
+| MySQL     | 192.168.2.200:3306     | 数据库 sikong_cloud_api
+| Redis     | 192.168.2.201:6379     | 本机 Redis (需在 201 上安装)
+| MinIO     | 192.168.2.200:9000     | 对象存储 (flydata bucket)
+| MQTT      | 223.113.158.186:11883  | DJI 上云 API broker
+| SRS       | 223.113.158.186:1935   | RTMP 推流 (外网映射)
+| 知眸 API  | 192.168.2.202:10042    | 知眸图片识别服务
+
+
+三、配置文件修改 (在开发机上改, 再打包上传)
+--------------------------------------------------------------------------------
+只改 2 个文件 (硬约束: 只改 src/main/resources/application-*.yml):
+
+【文件1】src/main/resources/application-company-a.yml
+
+  第 15 行  Redis host (已是 201, 不用改):
+    spring.data.redis.host: 192.168.2.201
+    注意: Spring Boot 2.7 前缀应为 spring.redis (不是 spring.data.redis)
+    修复: 把 spring.data.redis 改成 spring.redis
+
+  第 27 行  h5.host (必改):
+    h5.host: 192.168.2.201
+
+  第 61-63 行  内网推流/拉流地址 (已是 201, 不用改):
+    rtmp-url-internal: rtmp://192.168.2.201:1935/live
+    pull-url-template-internal: http://192.168.2.201:2022/live/...
+    rtmp-url-ai: rtmp://192.168.2.201:1935/live/ai/...
+
+  第 70 行  知眸回调 URL (必改! 不能用外网IP带端口, 会双端口拼接):
+    callback-url: http://192.168.2.201:8080/api/zhimou/callback
+
+  第 75 行  图片保存目录 (必改):
+    save-root-dir: /opt/sikong-cloud/zhimou-images
+
+  第 89 行  MinIO 临时目录 (必改):
+    temp-dir: /opt/sikong-cloud/zhimou-minio-temp
+
+  第 108 行  推送 URL (根据实际情况改, 不需要推送则 enabled: false):
+    push.url: http://192.168.2.150:9090/api/receive
+
+【文件2】src/main/resources/application-base.yml
+  一般不用改 (只调日志级别)
+
+
+四、打包 (在开发机 H:\traeproject\zhoudao 上执行)
+--------------------------------------------------------------------------------
+1. 修改配置文件 (见上方第三步)
+
+2. Maven 打包后端:
+   mvn -f H:\traeproject\zhoudao\pom.xml clean package -DskipTests
+   产出: target/sikong-cloud-api-1.0.0.jar
+
+3. 构建前端 (3个):
+   cd H:\traeproject\zhoudao\qianduan\admin-v3 && npm run build
+   → 产出: qianduan\admin-v3\dist
+
+   cd H:\traeproject\zhoudao\qianduan\screen-v3 && npm run build
+   → 产出: qianduan\screen-v3\dist
+
+   cd H:\traeproject\zhoudao\qianduan\h5-v3 && npm run build
+   → 产出: qianduan\h5-v3\dist
+
+4. 拷贝配置文件:
+   src/main/resources/application-base.yml    → config/
+   src/main/resources/application-company-a.yml → config/
+
+
+五、安装 201 服务器环境 (SSH 到 201)
+--------------------------------------------------------------------------------
+ssh nvidia@192.168.2.201  (或 root@192.168.2.201)
+
+1. 安装 JDK 17:
+   sudo apt update
+   sudo apt install -y openjdk-17-jdk
+   java -version  (确认)
+
+2. 安装 Nginx:
+   sudo apt install -y nginx
+
+3. 安装 Redis:
+   sudo apt install -y redis-server
+   sudo systemctl enable redis-server
+   sudo systemctl start redis-server
+
+4. 创建部署目录:
+   sudo mkdir -p /opt/sikong-cloud/{config,logs,zhimou-images,zhimou-minio-temp}
+   sudo chown -R $(whoami):$(whoami) /opt/sikong-cloud
+
+
+六、上传文件 (从开发机传到 201)
+--------------------------------------------------------------------------------
+1. 上传后端 jar:
+   scp target/sikong-cloud-api-1.0.0.jar nvidia@192.168.2.201:/opt/sikong-cloud/
+
+2. 上传配置文件:
+   scp config/*.yml nvidia@192.168.2.201:/opt/sikong-cloud/config/
+
+3. 上传前端 dist:
+   scp -r qianduan/admin-v3/dist nvidia@192.168.2.201:/opt/sikong-cloud/admin
+   scp -r qianduan/screen-v3/dist nvidia@192.168.2.201:/opt/sikong-cloud/screen
+   scp -r qianduan/h5-v3/dist nvidia@192.168.2.201:/opt/sikong-cloud/h5
+
+
+七、配置 Nginx (在 201 上)
+--------------------------------------------------------------------------------
+sudo tee /etc/nginx/sites-available/sikong-cloud <<'EOF'
+server {
+    listen 80;
+    server_name _;
+
+    # 大屏
+    location /screen/ {
+        alias /opt/sikong-cloud/screen/;
+        try_files $uri $uri/ /screen/index.html;
+    }
+
+    # 后台管理
+    location /admin/ {
+        alias /opt/sikong-cloud/admin/;
+        try_files $uri $uri/ /admin/index.html;
+    }
+
+    # H5
+    location /h5/ {
+        alias /opt/sikong-cloud/h5/;
+        try_files $uri $uri/ /h5/index.html;
+    }
+
+    # API 反代
+    location /api/ {
+        proxy_pass http://127.0.0.1:8080/api/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # 图片静态资源
+    location /zhimou-img/ {
+        alias /opt/sikong-cloud/zhimou-images/;
+    }
+
+    # 标注图
+    location /api/image-detect-img/ {
+        proxy_pass http://127.0.0.1:8080/api/image-detect-img/;
+    }
+}
+EOF
+
+sudo ln -sf /etc/nginx/sites-available/sikong-cloud /etc/nginx/sites-enabled/
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t  (测试配置)
+sudo systemctl restart nginx
+sudo systemctl enable nginx
+
+
+八、配置后端服务 (systemd 开机自启)
+--------------------------------------------------------------------------------
+sudo tee /etc/systemd/system/sikong-cloud.service <<'EOF'
+[Unit]
+Description=Sikong Cloud API
+After=network.target redis-server.service
+
+[Service]
+Type=simple
+User=nvidia
+WorkingDirectory=/opt/sikong-cloud
+ExecStart=/usr/bin/java -Dspring.profiles.active=base,company-a -jar /opt/sikong-cloud/sikong-cloud-api-1.0.0.jar
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/opt/sikong-cloud/logs/app.log
+StandardError=append:/opt/sikong-cloud/logs/app.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable sikong-cloud
+sudo systemctl start sikong-cloud
+
+
+九、验证
+--------------------------------------------------------------------------------
+1. 后端日志:
+   sudo journalctl -u sikong-cloud -f --no-pager | head -50
+   或: tail -f /opt/sikong-cloud/logs/app.log
+
+2. 检查 MQTT 连接 (日志里应有):
+   grep "MQTT" /opt/sikong-cloud/logs/app.log
+   期望: "MQTT连接成功" + "DJI 上云API MQTT客户端初始化成功"
+
+3. 检查端口:
+   ss -tlnp | grep -E '8080|80|6379'
+
+4. 访问验证:
+   curl http://localhost:8080/api/devices/list
+   curl http://localhost/screen/
+   curl http://localhost/admin/
+   curl http://localhost/h5/
+
+5. 知眸回调测试 (手动触发):
+   curl -X POST http://localhost:8080/api/zhimou/callback -H "Content-Type: application/json" -d "{}"
+   期望: 返回 200 (非 404)
+
+6. 外部认证测试:
+   curl -X POST http://localhost:8080/api/auth/api-key-login \
+     -H "X-API-Key: zhoudao-parent-key" \
+     -H "X-API-Secret: a8f3b2c1d9e7f0a5"
+   期望: 返回 {"code":200,"data":{"token":"xxx"}}
+
+
+十、外网映射 (如果需要外网访问)
+--------------------------------------------------------------------------------
+路由器/防火墙上配置端口映射:
+  外网 223.113.158.186:50080 → 内网 192.168.2.201:80
+
+同时修改 h5.host 为外网地址 (短信链接用):
+  h5.host: 223.113.158.186:50080
+
+注意: callback-url 不要改成外网地址!
+  保持: http://192.168.2.201:8080/api/zhimou/callback (内网直连)
+  原因: 外网 IP 带端口会导致 yml 变量拼接出双端口 (50080:8080)
+
+
+十一、踩坑记录 (必读)
+--------------------------------------------------------------------------------
+1. callback-url 不能用外网 IP 带端口
+   错误: http://223.113.158.186:50080:8080/api/zhimou/callback (双端口!)
+   正确: http://192.168.2.201:8080/api/zhimou/callback
+
+2. h5.host 和 callback-url 是分开的, 不要全局替换 IP
+   h5.host 可以带端口 (外网用)
+   callback-url 不要带外网端口
+
+3. Spring Boot 2.7 的 Redis 前缀是 spring.redis (不是 spring.data.redis)
+   错误: spring.data.redis.host
+   正确: spring.redis.host
+
+4. 启动参数: -Dspring.profiles.active=base,company-a
+   不是 test (没有 application-test.yml)
+
+5. 前端 dist 必须重新构建 (不能用旧 dist)
+   特别是 admin-v3, 新增了照片告警页面
+
+6. 知眸图片保存目录和 MinIO 临时目录要用 Linux 路径
+   错误: H:/traeproject/zhoudao/zhimou-images
+   正确: /opt/sikong-cloud/zhimou-images
+
+
+================================================================================
+配置文件快速检查清单 (部署前逐项确认)
+================================================================================
+[ ] h5.host = 192.168.2.201
+[ ] callback-url = http://192.168.2.201:8080/api/zhimou/callback
+[ ] spring.redis.host = 192.168.2.201 (注意前缀是 spring.redis 不是 spring.data.redis)
+[ ] save-root-dir = /opt/sikong-cloud/zhimou-images
+[ ] temp-dir = /opt/sikong-cloud/zhimou-minio-temp
+[ ] MySQL = 192.168.2.200:3306 (复用)
+[ ] MinIO = 192.168.2.200:9000 (复用)
+[ ] MQTT = tcp://223.113.158.186:11883 (外网)
+[ ] rtmp-url = rtmp://223.113.158.186:1935/live (外网推流)
+[ ] pull-url-template = http://223.113.158.186:2022/live/... (外网拉流)
+[ ] rtmp-url-internal = rtmp://192.168.2.201:1935/live (内网推流, 如有本地 SRS)
+[ ] push.enabled = true/false (根据需要)
+[ ] push.url = 实际推送目标地址
+================================================================================

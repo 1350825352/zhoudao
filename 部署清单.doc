@@ -1,4 +1,4 @@
----
+﻿---
 
 ## 📋 无人机监控平台 - Ubuntu 22.04 部署检查清单
 
@@ -76,7 +76,7 @@
 ##### ⑥ 大疆司空2 MQTT
 | 参数 | 说明 | 当前值 | 修改后 |
 |------|------|--------|--------|
-| `dji.mqtt.host` | MQTT 服务器地址 | `tcp://58.213.86.2:11883` | |
+| `dji.mqtt.host` | MQTT 服务器地址 | `tcp://223.113.158.186:11883` | |
 | `dji.mqtt.username` | MQTT 用户名 | `zhimou_aivis` | |
 | `dji.mqtt.password` | MQTT 密码 | `aivis@zhimou` | |
 
@@ -90,8 +90,8 @@
 ##### ⑧ 视频流服务器（SRS/Oryx）
 | 参数 | 说明 | 当前值 | 修改后 |
 |------|------|--------|--------|
-| `dji.media.stream-server.rtmp-url` | 公网 RTMP 推流地址 | `rtmp://58.213.86.2/live?...` | |
-| `dji.media.stream-server.pull-url-template` | 公网拉流地址模板 | `http://58.213.86.2:2022/...` | |
+| `dji.media.stream-server.rtmp-url` | 公网 RTMP 推流地址 | `rtmp://223.113.158.186/live?...` | |
+| `dji.media.stream-server.pull-url-template` | 公网拉流地址模板 | `http://223.113.158.186:2022/...` | |
 | `dji.media.stream-server.rtmp-url-internal` | 内网 RTMP | `rtmp://192.168.2.201:1935/...` | |
 | `dji.media.stream-server.pull-url-template-internal` | 内网拉流 | `http://192.168.2.201:2022/...` | |
 | `dji.media.stream-server.rtmp-url-ai` | AI 识别推流 | `rtmp://192.168.2.201/live/ai/...` | |

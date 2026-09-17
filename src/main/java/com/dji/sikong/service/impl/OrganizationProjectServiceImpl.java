@@ -80,8 +80,13 @@ public class OrganizationProjectServiceImpl
                 }
             }
             op.setLastSyncTime(LocalDateTime.now());
-            if (exist == null) mapper.insert(op);
-            else mapper.updateById(op);
+            if (exist == null) {
+                // 先物理删除可能已逻辑删除但唯一索引仍存在的旧记录
+                mapper.physicalDeleteByProjectUuid(puuid);
+                mapper.insert(op);
+            } else {
+                mapper.updateById(op);
+            }
             result.add(op);
         }
 

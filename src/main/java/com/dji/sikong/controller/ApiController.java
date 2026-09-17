@@ -39,7 +39,7 @@ import java.util.stream.Collectors;
 @CrossOrigin(origins = "*")
 public class ApiController {
 
-    private static final int STABLE_PROBE_THRESHOLD = 3;
+    private static final int STABLE_PROBE_THRESHOLD = 1;
     private static final ConcurrentHashMap<String, Integer> STREAM_STABLE_COUNT = new ConcurrentHashMap<>();
 
     @Resource
@@ -380,17 +380,22 @@ public class ApiController {
         LiveStream live = getActiveLiveStream(sn);
         if (live != null && live.getZhimouStatus() != null && live.getZhimouStatus() == 1) {
             String url = streamProbeService.buildAiRecognitionPullUrl(live, internal);
-            if (StrUtil.isNotBlank(url) && streamProbeService.isStreamPlayable(url)) {
+            // 探测始终用内网URL（后端服务器无法访问外网IP，避免NAT回环不通）
+            String probeUrl = streamProbeService.buildAiRecognitionPullUrl(live, true);
+            // url为空时用probeUrl作为返回URL（保证外网配置缺失时也能返回）
+            String returnUrl = StrUtil.isNotBlank(url) ? url : probeUrl;
+            log.info("[识别流-ApiController] internal={}, url={}, probeUrl={}, returnUrl={}", internal, url, probeUrl, returnUrl);
+            if (StrUtil.isNotBlank(returnUrl) && streamProbeService.isStreamPlayable(probeUrl)) {
                 int count = STREAM_STABLE_COUNT.getOrDefault(sn + ":rec", 0) + 1;
                 STREAM_STABLE_COUNT.put(sn + ":rec", count);
                 if (count >= STABLE_PROBE_THRESHOLD) {
-                    dto.setUrl(url);
-                    dto.setWhepUrl(flvUrlToWhepUrl(url));
+                    dto.setUrl(returnUrl);
+                    dto.setWhepUrl(flvUrlToWhepUrl(returnUrl));
                     dto.setAvailable(true);
                     return R.ok(dto);
                 } else {
-                    dto.setUrl(url);
-                    dto.setWhepUrl(flvUrlToWhepUrl(url));
+                    dto.setUrl(returnUrl);
+                    dto.setWhepUrl(flvUrlToWhepUrl(returnUrl));
                     dto.setAvailable(false);
                     log.info("[视频流] 识别流可播放但未稳定, sn={}, 连续成功={}/{}", sn, count, STABLE_PROBE_THRESHOLD);
                     return R.ok(dto);

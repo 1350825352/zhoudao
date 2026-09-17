@@ -6,6 +6,7 @@ import com.dji.sikong.config.DjiMediaProperties;
 import com.dji.sikong.entity.LiveStream;
 import com.dji.sikong.mapper.LiveStreamMapper;
 import com.dji.sikong.service.MediaServerStreamProbeService;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import javax.annotation.Resource;
@@ -15,6 +16,7 @@ import java.net.URL;
 import java.util.ArrayList;
 import java.util.List;
 
+@Slf4j
 @Service
 public class MediaServerStreamProbeServiceImpl implements MediaServerStreamProbeService {
 
@@ -171,6 +173,7 @@ public class MediaServerStreamProbeServiceImpl implements MediaServerStreamProbe
         } else {
             // 外网：从 pull-url-template-ai 构建
             String tpl = ss.getPullUrlTemplateAi();
+            log.info("[识别流-外网构建] tpl={}, streamKey={}, secret={}", tpl, streamKey, secret == null ? "null" : "有");
             if (StrUtil.isBlank(tpl)) return null;
             return buildPullUrl(tpl, streamKey, secret);
         }

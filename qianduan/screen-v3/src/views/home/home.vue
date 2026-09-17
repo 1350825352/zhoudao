@@ -50,6 +50,7 @@
             class="video-player"
             :style="video.ratio ? { aspectRatio: video.ratio } : {}"
             @loadedmetadata="(e) => onVideoLoaded(e, video.id)"
+            @resize="(e) => onVideoLoaded(e, video.id)"
           ></video>
         </div>
       </div>
@@ -553,7 +554,7 @@ onUnmounted(() => {
       aspect-ratio: 16/9;
       background: #000;
       display: block;
-      object-fit: contain;
+      object-fit: fill;
     }
   }
 }

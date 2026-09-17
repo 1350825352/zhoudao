@@ -154,8 +154,13 @@ public class WaylineServiceImpl extends ServiceImpl<WaylineMapper, Wayline> impl
                     }
                 }
 
-                if (exist == null) waylineMapper.insert(w);
-                else waylineMapper.updateById(w);
+                if (exist == null) {
+                    // 先物理删除可能已逻辑删除但唯一索引仍存在的旧记录
+                    waylineMapper.physicalDeleteByWaylineUuid(wuuid);
+                    waylineMapper.insert(w);
+                } else {
+                    waylineMapper.updateById(w);
+                }
                 result.add(w);
             }
         }
