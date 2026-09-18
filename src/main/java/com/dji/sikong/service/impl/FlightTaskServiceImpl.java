@@ -65,6 +65,7 @@ public class FlightTaskServiceImpl extends ServiceImpl<FlightTaskMapper, FlightT
             aircraft = deviceService.lambdaQuery()
                     .eq(Device::getGatewaySn, dto.getGatewaySn())
                     .eq(Device::getDeleted, 0)
+                    .last("LIMIT 1")
                     .one();
         }
 

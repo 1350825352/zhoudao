@@ -1,0 +1,113 @@
+company:
+  name: "石知韵智能科技"
+
+server:
+  port: 8080
+
+spring:
+  datasource:
+    url: jdbc:mysql://192.168.2.201:3306/sikong_cloud_api?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
+    username: szy02
+    password: 123456
+
+  redis:
+    host: 192.168.2.201
+    port: 6379
+    password: ""
+    database: 0
+
+  mail:
+    host: smtp.qq.com
+    port: 587
+    username: 1350825352@qq.com
+    password: yxrogsudehnvhhad
+
+h5:
+  host: 223.113.158.186
+  port: 33026
+  context-path: h5
+
+dji:
+  mqtt:
+    host: tcp://223.113.158.186:11883
+    username: openapi
+    password: openapi@zhimou
+    client-id: sikong-cloud-api-${random.uuid}
+    connection-timeout: 30
+    keep-alive: 60
+    clean-session: true
+    automatic-reconnect: true
+    subscribe-topics:
+      - sys/product/+/status
+      - thing/product/+/osd
+      - thing/product/+/state
+      - thing/product/+/events
+      - thing/product/+/requests
+      - thing/product/+/services_reply
+      - thing/product/+/property/set_reply
+      - thing/product/+/property/post
+      - thing/product/+/drc/up
+      - thing/product/+/drc/down_reply
+
+  openapi:
+    user-token: eyJhbGciOiJIUzUxMiIsImNyaXQiOlsidHlwIiwiYWxnIiwia2lkIl0sImtpZCI6IjhiZmRiZmRkLWM4OGYtNGE5Yi04NzI3LWQ0ZGYzYWE5OTJlOSIsInR5cCI6IkpXVCJ9.eyJhY2NvdW50IjoiIiwiZXhwIjoyMDY3NjcyNDA3LCJuYmYiOjE3NTIxMzk2MDcsIm9yZ2FuaXphdGlvbl91dWlkIjoiODU2NmM3ZGUtMDVhYy00MWVlLWIyNjAtMTYxNDg0OGVkMDM3IiwicHJvamVjdF91dWlkIjoiIiwic3ViIjoiZmgyIiwidXNlcl9pZCI6IjEyNTcyMTIyODY5ODM3NTc4MjQifQ.brYj6iCfUyLl8O5XAmjKQF7yI1IAm-ehjKGRm9wiesK87ZmYS3s3KmPM-8WyhNaOVhEYORkdqkIC9yRt87UbUw
+    default-organization-uuid: 8566c7de-05ac-41ee-b260-1614848ed037
+    default-project-uuid: 826ccf49-8430-4037-a505-cd43b868d4d6
+
+  media:
+    stream-server:
+      rtmp-url: rtmp://223.113.158.186:1935/live?secret=f91c3c6060cd401b99ae649fc50a9bb6
+      pull-url-template: http://223.113.158.186:2022/live/{streamKey}.flv?secret={secret}
+      rtmp-url-internal: rtmp://192.168.2.201:1935/live?secret=f91c3c6060cd401b99ae649fc50a9bb6
+      pull-url-template-internal: http://192.168.2.201:2022/live/{streamKey}.flv?secret={secret}
+      rtmp-url-ai: rtmp://192.168.2.201:1935/live/ai/{streamKey}?secret={secret}
+      pull-url-template-ai: http://223.113.158.186:2022/live/ai/{streamKey}.flv?secret={secret}
+
+zhimou:
+  openapi:
+    base-url: http://192.168.2.202:10042
+    appkey: 75eda2b9aa530c05090ce6c3f48af94b
+    appsecret: gdKfyFDy39L494HGVwlkWdLKlID9Syc3
+    callback-url: http://192.168.2.130:8080/api/zhimou/callback
+    default-app-id: "3y14nhqxbd,napvhsbecn"
+    default-pkg-id: "par579tq"
+
+  image:
+    save-root-dir: H:/traeproject/zhoudao/zhimou-images
+    url-prefix: /zhimou-img/
+
+# ============================================================
+# 阶段3：MinIO 轮询图片同步（司空2 fh_sync 同步到内网 MinIO）
+# 真实路径: flydata/fh_sync/{ORG_UUID}/{PROJECT_UUID}/media/{TASK_UUID}/{FILENAME}
+# ============================================================
+minio:
+  endpoint: http://192.168.2.200:9000
+  access-key: admin
+  secret-key: Admin@123456
+  bucket: flydata
+  scan-prefix: fh_sync/
+  poll-interval-ms: 30000
+  temp-dir: H:/traeproject/zhoudao/zhimou-minio-temp
+  cleanup-temp-after: true
+  validate-upload-count-before-process: true
+  batch-lock-ttl-sec: 1800
+  image-status-ttl-days: 7
+
+# ============================================================
+# 外部系统认证 (API Key 换取 Token)
+# ============================================================
+external-auth:
+  api-key: "zhoudao-parent-key"
+  api-secret: "a8f3b2c1d9e7f0a5"
+  token-ttl: 86400
+
+# ============================================================
+# 识别数据推送 (清洗后异步POST到外部接口)
+# ============================================================
+push:
+  enabled: true
+  url: "http://192.168.2.150:9090/api/receive"
+  timeout: 3000
+  max-retries: 3
+  retry-delays: [3000, 5000]
+  confirm-mode: "code0"

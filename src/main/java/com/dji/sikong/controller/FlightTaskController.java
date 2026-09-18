@@ -27,13 +27,16 @@ public class FlightTaskController {
 
     @PostMapping("/execute")
     public R<FlightTask> executeTask(@RequestBody @Validated ExecuteFlightTaskDTO dto) {
+        System.out.println("[执行任务-DEBUG] 收到请求: taskName=" + dto.getTaskName() + " gatewaySn=" + dto.getGatewaySn() + " waylineUuid=" + dto.getWaylineUuid() + " rthAltitude=" + dto.getRthAltitude());
         try {
             FlightTask task = flightTaskService.executeTask(dto);
+            System.out.println("[执行任务-结果] taskStatus=" + task.getTaskStatus() + " statusMessage=" + task.getStatusMessage());
             if (task.getTaskStatus() == 6) {
                 return R.fail(task.getStatusMessage() == null ? "任务下发失败" : task.getStatusMessage());
             }
             return R.ok(task);
         } catch (Exception e) {
+            System.out.println("[执行任务-异常] " + e.getClass().getSimpleName() + ": " + e.getMessage());
             return R.fail(e.getMessage());
         }
     }
