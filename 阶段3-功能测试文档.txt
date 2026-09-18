@@ -1,0 +1,860 @@
+================================================================================
+ 阶段3 MinIO 轮询图片识别 - 功能测试文档
+ 生成时间：2026-08-26
+ 适用版本：阶段3 v1.0（commit a0b3ebf 之后）
+ 测试目标：验证 MinIO 轮询 → 司空2校验 → 并行识别 → 自动清洗 → 告警展示 全链路
+================================================================================
+
+目录
+----
+  0. 测试前置条件
+  1. 启动与健康检查测试
+  2. 开关控制测试
+  3. MinIO 轮询扫描测试
+  4. 完整性校验测试
+  5. drone_sn 获取测试
+  6. 批次锁与防重测试
+  7. 图片下载测试
+  8. 知眸图片任务测试（带 prefix）
+  9. 自有模型识别测试（带 customLocalImageName）
+  10. 自动清洗触发测试（核心！）
+  11. 批次 COMPLETED 标记与 tempDir 清理测试
+  12. 运维接口测试
+  13. 前端告警展示测试
+  14. 阶段2手动入口兼容性测试
+  15. 异常场景测试
+  16. 端到端全流程测试
+  17. 测试结果汇总表
+
+================================================================================
+
+
+0. 测试前置条件
+================================================================================
+
+【环境要求】
+  - Java 17 + Maven
+  - MySQL 192.168.2.200:3306/sikong_cloud_api（表已建）
+  - Redis 192.168.2.200:6379
+  - MinIO 192.168.2.200:9000（bucket=flydata，内有 fh_sync/ 真实数据）
+  - 知眸服务 192.168.2.202:10042（可达）
+  - 自有模型 192.168.2.200:5173/detect（可达）
+  - 司空2 OpenAPI https://es-flight-api-cn.djigate.com（Token 有效）
+
+【配置确认】
+  src/main/resources/application-company-a.yml 中：
+    dji.openapi.user-token = eyJhbGci...（有效 JWT）
+    dji.openapi.default-organization-uuid = 8566c7de-05ac-41ee-b260-1614848ed037
+    dji.openapi.default-project-uuid = 826ccf49-8430-4037-a505-cd43b868d4d6
+    minio.endpoint = http://192.168.2.200:9000
+    minio.access-key = admin
+    minio.secret-key = Admin@123456
+    minio.bucket = flydata
+    zhimou.openapi.default-app-id = "3y14nhqxbd,napvhsbecn"
+    zhimou.openapi.default-pkg-id = "par579tq"
+    zhimou.image.save-root-dir = H:/traeproject/zhoudao/zhimou-images
+
+【真实测试数据】
+  MinIO 中已有真实飞行批次：
+    flydata/fh_sync/8566c7de.../826ccf49.../media/dbc84414-a612-4637-9964-ea4e8c3ca2a6/
+      ├── DJI_20260826130711_0001_V.jpeg
+      ├── DJI_20260826130711_0002_V.jpeg
+      ├── ... (共15张)
+      └── DJI_20260826130711_0015_V.jpeg
+  对应的司空2 task_uuid = dbc84414-a612-4637-9964-ea4e8c3ca2a6
+  drone_sn = 1581F8HHX25CL00A06BL (Matrice 4D)
+
+【工具准备】
+  - Postman 或 curl（调运维接口）
+  - Redis CLI（查看 key 状态）
+  - MySQL Client（查表数据）
+  - 浏览器（访问 screen-v3 前端）
+
+
+================================================================================
+
+
+1. 启动与健康检查测试
+================================================================================
+
+【测试1.1】MinIO 连接成功
+  前置：application-company-a.yml 中 minio.endpoint 配置正确
+  步骤：启动 Spring Boot 应用
+  预期：控制台输出
+    [MinIO] 连接成功，endpoint=http://192.168.2.200:9000, bucket=flydata ✅
+  实际：________________________________
+
+【测试1.2】MinIO 配置为空时降级
+  前置：把 minio.endpoint 改为空值，重启
+  步骤：启动应用
+  预期：控制台输出
+    [MinIO] endpoint 未配置，跳过 MinioClient 初始化（阶段3功能不可用）
+    且不抛出异常，应用正常启动
+  实际：________________________________
+
+【测试1.3】MinIO bucket 不存在
+  前置：把 minio.bucket 改为一个不存在的桶名（如 flydata_test），重启
+  步骤：启动应用
+  预期：控制台输出
+    [MinIO] bucket 不存在! endpoint=..., bucket=flydata_test，请先到 MinIO 控制台创建
+    且不阻断应用启动
+  实际：________________________________
+
+
+================================================================================
+
+
+2. 开关控制测试
+================================================================================
+
+【测试2.1】image_task=0（关闭）时轮询跳过
+  前置：
+    Redis 或 DB 中 image_task = 0
+    MinIO 中有未处理的飞行批次
+  步骤：
+    1. 确认 image_task=0
+       Redis: GET task_switch:image_task  → "0"
+       或 DB: SELECT value FROM task_switch WHERE switch_key='image_task'
+    2. 等待 30s（一个轮询周期）
+    3. 查 Redis: KEYS minio:flight:*
+  预期：
+    - 控制台输出 [MinIO轮询] image_task 已关闭，本轮跳过
+    - Redis 中无 minio:flight:* 任何 key（未处理任何批次）
+  实际：________________________________
+
+【测试2.2】image_task=1（开启）时轮询执行
+  前置：
+    image_task = 1
+    MinIO 中有未处理的飞行批次（如 dbc84414...）
+  步骤：
+    1. 设置 image_task=1
+       Redis: SET task_switch:image_task 1
+    2. 等待 30s 或手动 POST /api/minio/scan-now
+  预期：
+    - 控制台输出 [MinIO轮询] 扫描到 1 个候选飞行任务批次
+    - Redis 中出现 minio:flight:dbc84414... = PROCESSING
+  实际：________________________________
+
+
+================================================================================
+
+
+3. MinIO 轮询扫描测试
+================================================================================
+
+【测试3.1】路径正则匹配
+  前置：MinIO 中有真实路径
+    fh_sync/8566c7de.../826ccf49.../media/dbc84414.../DJI_20260826130711_0001_V.jpeg
+  步骤：POST /api/minio/scan-now
+  预期：
+    - 控制台输出 [MinIO轮询] 扫描到 1 个候选飞行任务批次, 开始逐个校验
+    - 日志中 taskUuid=dbc84414-a612-4637-9964-ea4e8c3ca2a6, 图片数=15
+  实际：________________________________
+
+【测试3.2】多组织/多项目隔离
+  前置：MinIO 中同时有
+    fh_sync/8566c7de.../826ccf49.../media/任务A/...
+    fh_sync/其他org/其他proj/media/任务B/...
+  步骤：POST /api/minio/scan-now
+  预期：
+    - 只匹配 org=8566c7de + proj=826ccf49 的任务A
+    - 任务B 因 org/proj 不匹配被正则跳过
+    - 日志中只有 1 个候选批次
+  实际：________________________________
+
+【测试3.3】空目录扫描
+  前置：MinIO 中 fh_sync/ 下无任何匹配的图片文件
+  步骤：POST /api/minio/scan-now
+  预期：
+    - 控制台输出 [MinIO轮询] 暂无飞行任务图片目录（0个批次）
+    - 不做任何后续 API 调用
+  实际：________________________________
+
+
+================================================================================
+
+
+4. 完整性校验测试
+================================================================================
+
+【测试4.1】上传完整时正常处理
+  前置：
+    MinIO 有 15 张图
+    司空2 getFlightTaskInfo 返回 folder_info.expected=15, uploaded=15
+    司空2 getFlightTaskMedia 返回 15 条
+  步骤：POST /api/minio/scan-now
+  预期：
+    - 日志 [MinIO轮询] ✅ 拿到处理锁 taskUuid=dbc84414..., 图片数=15, TTL=1800s
+    - 继续获取 drone_sn 并下载
+  实际：________________________________
+
+【测试4.2】上传未完成时跳过
+  前置：模拟司空2 返回 expected=15, uploaded=10
+  步骤：POST /api/minio/scan-now
+  预期：
+    - 日志 [MinIO轮询] taskUuid=... 仍在同步中 (uploaded=10/expected=15)，跳过本轮
+    - 不拿锁，不下载，Redis 无 PROCESSING
+    - 下一轮 30s 后会再扫描
+  实际：________________________________
+
+【测试4.3】media 数量与 MinIO 数量不一致时跳过
+  前置：MinIO 有 15 张，但司空2 media API 只返回 10 条
+  步骤：POST /api/minio/scan-now
+  预期：
+    - 日志 [MinIO轮询] taskUuid=... media接口数=10 != MinIO数=15，同步未完成跳过本轮
+  实际：________________________________
+
+【测试4.4】关闭完整性校验
+  前置：minio.validate-upload-count-before-process = false
+  步骤：POST /api/minio/scan-now
+  预期：
+    - 不调 getFlightTaskInfo / getFlightTaskMedia
+    - 直接拿锁 → 下载 → 处理
+  实际：________________________________
+
+
+================================================================================
+
+
+5. drone_sn 获取测试
+================================================================================
+
+【测试5.1】从 detail API 获取真实 SN
+  前置：image_task=1, MinIO 有 dbc84414... 批次
+  步骤：POST /api/minio/scan-now
+  预期：
+    - 日志 [MinIO轮询] taskUuid=dbc84414... 飞行任务名=航线任务-测试航线-2026-8-26, SN=1581F8HHX25CL00A06BL
+    - 知眸任务 createImageTask 传入的 device_id = 1581F8HHX25CL00A06BL（非 LOCAL-TEST-SN）
+  实际：________________________________
+
+【测试5.2】SN 为空时跳过批次
+  前置：模拟 detail API 返回 flight_pieces[0].drone_sn = null
+  步骤：POST /api/minio/scan-now
+  预期：
+    - 日志 [MinIO轮询] taskUuid=... 无法从 detail API 取到 drone_sn，跳过
+    - Redis 锁被释放（DELETE minio:flight:taskUuid）
+    - 不执行知眸/自有模型
+  实际：________________________________
+
+
+================================================================================
+
+
+6. 批次锁与防重测试
+================================================================================
+
+【测试6.1】SETNX 抢锁成功
+  前置：Redis 中无 minio:flight:dbc84414... key
+  步骤：POST /api/minio/scan-now
+  预期：
+    - Redis: GET minio:flight:dbc84414... → "PROCESSING"
+    - TTL: TTL minio:flight:dbc84414... → 约 1800 秒
+  实际：________________________________
+
+【测试6.2】已有 PROCESSING 时跳过
+  前置：手动 SET minio:flight:dbc84414... PROCESSING
+  步骤：POST /api/minio/scan-now
+  预期：
+    - 日志 [MinIO轮询] taskUuid=dbc84414... 已被其他实例锁定，跳过
+    - 不重复下载、不重复处理
+  实际：________________________________
+
+【测试6.3】COMPLETED 时永久跳过
+  前置：手动 SET minio:flight:dbc84414... COMPLETED
+  步骤：POST /api/minio/scan-now
+  预期：
+    - 日志中 taskUuid=dbc84414... 被跳过（batchState != null 且 == COMPLETED）
+    - 不做任何处理
+  实际：________________________________
+
+【测试6.4】PROCESSING TTL 过期后自动重试
+  前置：
+    手动 SET minio:flight:dbc84414... PROCESSING
+    TTL 设为 5 秒
+  步骤：
+    1. 等待 6 秒让 TTL 过期
+    2. POST /api/minio/scan-now
+  预期：
+    - Redis key 已自动过期消失
+    - 重新抢锁成功，重新处理
+  实际：________________________________
+
+
+================================================================================
+
+
+7. 图片下载测试
+================================================================================
+
+【测试7.1】批量下载到 tempDir
+  前置：minio.temp-dir = H:/traeproject/zhoudao/zhimou-minio-temp
+  步骤：POST /api/minio/scan-now
+  预期：
+    - 目录 H:/traeproject/zhoudao/zhimou-minio-temp/dbc84414.../ 下出现 15 个 jpeg 文件
+    - 文件名与 MinIO ObjectKey 末尾段一致（DJI_20260826130711_0001_V.jpeg 等）
+    - 日志 [MinIO轮询] 下载 taskUuid=dbc84414... 成功=15/失败=0
+  实际：________________________________
+
+【测试7.2】残留旧文件清理
+  前置：
+    在 temp-dir/dbc84414.../ 下手动放一个 旧文件 old.jpg
+  步骤：POST /api/minio/scan-now
+  预期：
+    - 日志 [MinIO轮询] taskUuid=dbc84414... 临时目录非空，先清理后再下载
+    - old.jpg 被删除
+    - 只下载最新的 15 张图
+  实际：________________________________
+
+【测试7.3】下载失败单张容错
+  前置：模拟某张图 objectKey 权限不足或不存在
+  步骤：POST /api/minio/scan-now
+  预期：
+    - 失败的那张被跳过，其他 14 张正常下载
+    - 日志 [MinIO轮询] 下载失败 objectKey=...
+    - 继续处理 14 张（不中断整个批次）
+  实际：________________________________
+
+
+================================================================================
+
+
+8. 知眸图片任务测试（带 prefix）
+================================================================================
+
+【测试8.1】createAndReportImageBatch 带 prefix
+  前置：MinIO 批次已下载到本地
+  步骤：POST /api/minio/scan-now（或观察自动轮询）
+  预期：
+    - 知眸创建任务成功，返回 taskId
+    - 日志 [知眸-图片批量上报] 创建任务成功 taskId=..., 待上报图片数=15, prefix=dbc84414...
+    - 每张图 Redis meta key:
+        zhimou:img:meta:{taskId}:1  → local_image_name = "dbc84414.../DJI_20260826130711_0001_V"
+        zhimou:img:meta:{taskId}:2  → local_image_name = "dbc84414.../DJI_20260826130711_0002_V"
+        ...（注意：带 "/" 前缀，不再是旧的去扩展名格式）
+    - 知眸 DB 表 zhimou_task 中 aircraft_sn = 1581F8HHX25CL00A06BL（真实SN）
+  验证命令：
+    Redis: HGETALL zhimou:img:meta:{taskId}:1
+    期望 local_image_name 字段值 = "dbc84414-a612-4637-9964-ea4e8c3ca2a6/DJI_20260826130711_0001_V"
+  实际：________________________________
+
+【测试8.2】上报间隔 1 秒
+  前置：批次 15 张图
+  步骤：观察知眸上报日志时间戳
+  预期：
+    - 每张图上报间隔约 1000ms（知眸最小间隔约束）
+    - 15 张图总耗时约 15 秒
+  实际：________________________________
+
+【测试8.3】图片落盘到长期目录
+  前置：zhimou.image.save-root-dir = H:/traeproject/zhoudao/zhimou-images
+  步骤：处理完成后检查
+  预期：
+    - H:/traeproject/zhoudao/zhimou-images/yyyyMMdd/DJI_20260826130711_0001_V.jpeg 存在
+    - 与知眸上报的文件一致
+  实际：________________________________
+
+
+================================================================================
+
+
+9. 自有模型识别测试（带 customLocalImageName）
+================================================================================
+
+【测试9.1】detectAndSave 4参数重载
+  前置：批次已下载
+  步骤：观察自有模型线程日志
+  预期：
+    - 日志 [自有模型] 入库 id=..., localImageName=dbc84414.../DJI_20260826130711_0001_V
+    - DB self_model_image_detection 表中 local_image_name = "dbc84414.../DJI_..._0001_V"
+    - call_status = 1（成功）
+    - clean_status = 0（未清洗）
+  验证命令：
+    MySQL: SELECT id, local_image_name, call_status, clean_status, hit_count
+           FROM self_model_image_detection
+           WHERE local_image_name LIKE 'dbc84414%' ORDER BY id DESC LIMIT 15;
+  实际：________________________________
+
+【测试9.2】每张间隔 500ms
+  步骤：观察自有模型处理日志时间戳
+  预期：
+    - 每张图处理间隔约 500ms
+    - 15 张图总耗时约 7.5 秒（不含模型调用耗时）
+  实际：________________________________
+
+【测试9.3】模型调用失败容错
+  前置：模拟自有模型服务 192.168.2.200:5173 不可达
+  步骤：POST /api/minio/scan-now
+  预期：
+    - 日志 [自有模型] 调用异常 fileName=...
+    - 仍入库 self_model_image_detection，call_status=2, error_message 有值
+    - clean_status=0，后续可手动补洗
+  实际：________________________________
+
+
+================================================================================
+
+
+10. 自动清洗触发测试（核心！）
+================================================================================
+
+  这是阶段3最核心的功能：知眸回调 + 自有模型入库两边到齐后自动清洗。
+  需要分别测试"知眸先到"和"自有先到"两种时序。
+
+【测试10.1】自有模型先入库，知眸回调后到 → 自动清洗
+  前置：
+    image_task=1
+    MinIO 有 dbc84414... 批次（15张图）
+  步骤：
+    1. POST /api/minio/scan-now
+    2. 等待自有模型处理完成（约 8s）
+    3. 查 Redis: GET minio:flight:img:dbc84414.../DJI_..._0001_V
+       预期 hash 中有 self=1，无 zhimou（知眸回调还没来）
+    4. 等待知眸回调到达（约 1-5s 后）
+    5. 查日志
+  预期：
+    - 日志 [知眸-图片回调] 入库成功 ... localImageName=dbc84414.../DJI_..._0001_V
+    - 日志 [自动清洗] ⭐ 知眸与自有模型结果均到齐 → 启动 cleanup localImageName=dbc84414.../DJI_..._0001_V
+    - 日志 [清洗] 完成 localImageName=dbc84414.../DJI_..._0001_V, 结果=..., cleanStatus=1或2
+    - Redis: minio:flight:img:dbc84414.../DJI_..._0001_V 已被 DELETE
+    - DB: zhimou_image_detection.clean_status != 0
+    - DB: self_model_image_detection.clean_status != 0
+  验证命令：
+    Redis: EXISTS minio:flight:img:dbc84414.../DJI_20260826130711_0001_V  → 0 (已删)
+    MySQL: SELECT local_image_name, clean_status, clean_time, clean_remark
+           FROM zhimou_image_detection
+           WHERE local_image_name LIKE 'dbc84414%' AND deleted=0;
+    MySQL: SELECT local_image_name, clean_status, clean_time, clean_remark
+           FROM self_model_image_detection
+           WHERE local_image_name LIKE 'dbc84414%' AND deleted=0;
+  实际：________________________________
+
+【测试10.2】知眸回调先到，自有模型后入库 → 自动清洗
+  前置：
+    知眸处理速度 > 自有模型（理论上知眸回调通常在1s内到达）
+  步骤：
+    1. POST /api/minio/scan-now
+    2. 等待知眸回调到达（日志 [知眸-图片回调] 入库成功）
+    3. 查 Redis: GET minio:flight:img:dbc84414.../DJI_..._0001_V
+       预期 hash 中有 zhimou=1，无 self（自有还没入库）
+    4. 等待自有模型入库（约 0.5s 后）
+    5. 查日志
+  预期：
+    - 日志 [自有模型] 入库 ... localImageName=dbc84414.../DJI_..._0001_V
+    - 日志 [自动清洗] ⭐ 自有模型与知眸结果均到齐 → 启动 cleanup
+    - 清洗结果同 10.1
+  实际：________________________________
+
+【测试10.3】全部 15 张图都自动清洗完成
+  前置：批次 15 张图全部处理完
+  步骤：
+    1. 等待所有知眸回调和自有模型入库完成
+    2. 检查 DB 和 Redis
+  预期：
+    - 15 条 zhimou_image_detection 的 clean_status 全部 != 0
+    - 15 条 self_model_image_detection 的 clean_status 全部 != 0
+    - Redis: KEYS minio:flight:img:dbc84414...* → 空（全部已清理）
+  验证命令：
+    Redis: KEYS minio:flight:img:dbc84414*
+    期望返回 (empty list or nil)
+    MySQL: SELECT clean_status, COUNT(*) FROM zhimou_image_detection
+           WHERE local_image_name LIKE 'dbc84414%' AND deleted=0
+           GROUP BY clean_status;
+    期望：只有 1 和 2，没有 0
+  实际：________________________________
+
+【测试10.4】误识别判定（clean_status=2）
+  前置：
+    知眸和自有模型对同一张图都识别出目标，且目标位置匹配（中心点距离<50px）
+  步骤：检查清洗结果
+  预期：
+    - clean_status = 2（误识别）
+    - clean_remark = "误识别(知眸N个目标全部匹配自有模型)"
+    - 前端 alert_data_source=image 时不展示该条
+  实际：________________________________
+
+【测试10.5】正常识别判定（clean_status=1）
+  前置：
+    知眸有目标但自有模型无目标，或两者目标位置不匹配
+  步骤：检查清洗结果
+  预期：
+    - clean_status = 1（正常）
+    - clean_remark = "自有模型无有效结果, 判定正常" 或 "正常(知眸N个目标中M个匹配)"
+    - 前端 alert_data_source=image 时展示该条
+  实际：________________________________
+
+
+================================================================================
+
+
+11. 批次 COMPLETED 标记与 tempDir 清理测试
+================================================================================
+
+【测试11.1】批次标记 COMPLETED
+  前置：15 张图全部清洗完成
+  步骤：检查 Redis
+  预期：
+    - Redis: GET minio:flight:dbc84414... → "COMPLETED"（无 TTL，永久）
+    - 日志 [MinIO批次] ✅ 标记 COMPLETED taskUuid=dbc84414...
+  验证命令：
+    Redis: GET minio:flight:dbc84414-a612-4637-9964-ea4e8c3ca2a6
+    期望 "COMPLETED"
+    Redis: TTL minio:flight:dbc84414-a612-4637-9964-ea4e8c3ca2a6
+    期望 -1 (永久)
+  实际：________________________________
+
+【测试11.2】tempDir 清理
+  前置：minio.cleanup-temp-after = true
+  步骤：批次 COMPLETED 后检查
+  预期：
+    - 目录 H:/traeproject/zhoudao/zhimou-minio-temp/dbc84414.../ 不存在（已删除）
+    - 日志 [MinIO批次] 删除临时下载目录 ... result=true
+  实际：________________________________
+
+【测试11.3】关闭 tempDir 清理
+  前置：minio.cleanup-temp-after = false
+  步骤：批次 COMPLETED 后检查
+  预期：
+    - tempDir/dbc84414.../ 目录仍存在（保留供排错）
+  实际：________________________________
+
+【测试11.4】COMPLETED 后不再重复处理
+  前置：Redis minio:flight:dbc84414... = COMPLETED
+  步骤：POST /api/minio/scan-now
+  预期：
+    - 日志中 taskUuid=dbc84414... 被跳过
+    - 不重新下载、不重新创建知眸任务、不重新入库
+  实际：________________________________
+
+
+================================================================================
+
+
+12. 运维接口测试
+================================================================================
+
+【测试12.1】GET /api/minio/batches
+  前置：Redis 中有几个批次 key
+  步骤：GET /api/minio/batches
+  预期：
+    返回 JSON：
+    {
+      "code": 200,
+      "data": {
+        "dbc84414-a612-...": "COMPLETED",
+        "其他taskUuid": "PROCESSING"
+      }
+    }
+  实际：________________________________
+
+【测试12.2】POST /api/minio/retry/{taskUuid}
+  前置：
+    dbc84414... 当前 = COMPLETED
+    想重跑该批次
+  步骤：POST /api/minio/retry/dbc84414-a612-4637-9964-ea4e8c3ca2a6
+  预期：
+    - 日志 [MinIO运维] 收到手动重试 taskUuid=dbc84414...
+    - 日志 [MinIO轮询] 运维手动重试 taskUuid=dbc84414...，已清理Redis批次+图片级状态
+    - Redis: GET minio:flight:dbc84414... → null（已删除）
+    - Redis: KEYS minio:flight:img:dbc84414...* → 空（已删除）
+    - 立刻重新处理（重新拿锁 → 下载 → 知眸 → 自有模型 → 回调 → 清洗）
+    - 返回 {"code":200, "data":"已提交重试..."}
+  实际：________________________________
+
+【测试12.3】POST /api/minio/scan-now
+  前置：任意状态
+  步骤：POST /api/minio/scan-now
+  预期：
+    - 立即触发一次 scanAndProcess
+    - 返回 {"code":200, "data":"立即扫描已触发..."}
+    - 日志中能看到本轮扫描结果
+  实际：________________________________
+
+【测试12.4】retry 空 taskUuid
+  步骤：POST /api/minio/retry/
+  预期：404 或 400（路径不匹配）
+  实际：________________________________
+
+
+================================================================================
+
+
+13. 前端告警展示测试
+================================================================================
+
+【测试13.1】alert_data_source=image 展示清洗后数据
+  前置：
+    阶段3已处理完一个批次，zhimou_image_detection 有 clean_status=1 和 clean_status=2 的记录
+    TaskSwitch alert_data_source = "image"
+  步骤：
+    1. 前端切换数据源为 image（admin 页面）
+    2. 访问 screen-v3 /alerts 页面
+  预期：
+    - 只展示 clean_status != 0 的记录（1=正常展示，2=误识别不展示或灰显）
+    - clean_status=0 的记录不展示（未清洗的不给前端看）
+    - 展示的记录包含 local_image_name, hit_count, targets_json, gps 等
+  实际：________________________________
+
+【测试13.2】alert_data_source=video 不受影响
+  前置：alert_data_source = "video"
+  步骤：访问 /alerts
+  预期：
+    - 查 zhimou_detection_result 表（旧视频表）
+    - 与阶段3 无关，行为不变
+  实际：________________________________
+
+【测试13.3】阶段3 记录与阶段2 手动记录共存
+  前置：
+    阶段2 手动入口产生的记录 local_image_name = "DJI_..._0001_V"（无前缀）
+    阶段3 自动入口产生的记录 local_image_name = "dbc84414.../DJI_..._0001_V"（有前缀）
+  步骤：前端 image 数据源查看
+  预期：
+    - 两种记录都正常展示（local_image_name 不同，不会互相覆盖）
+    - 不会出现跨架次误清洗（local_image_name 精确匹配）
+  实际：________________________________
+
+
+================================================================================
+
+
+14. 阶段2手动入口兼容性测试
+================================================================================
+
+【测试14.1】POST /test/image-recognition/run 仍可用
+  前置：
+    准备一个本地图片目录 testimage/ 内含几张 DJI 图片
+    image_task=1
+  步骤：
+    POST /test/image-recognition/run
+    Body:
+    {
+      "imageDir": "testimage",
+      "imageBaseDir": "zhimou-images",
+      "aircraftSn": "LOCAL-TEST-SN",
+      "appId": "napvhsbecn",
+      "applicationPackageId": "par579tq",
+      "threshold": 0.5,
+      "runZhimou": true,
+      "runSelfModel": true
+    }
+  预期：
+    - 正常返回 {"code":200, "data":{"imageCount":N, "zhimouTaskId":"tsk_..."}}
+    - DB 中 local_image_name = "DJI_..._0001_V"（无前缀，旧格式）
+    - 知眸 Redis meta 中 local_image_name 也是旧格式
+    - 不会触发自动清洗（因为手动入口 self 侧不写 minio:flight:img:* key）
+  实际：________________________________
+
+【测试14.2】POST /test/image-recognition/cleanup 仍可用
+  前置：14.1 已执行，知眸回调已到达
+  步骤：
+    POST /test/image-recognition/cleanup?localImageName=DJI_..._0001_V
+  预期：
+    - 正常清洗，返回结果描述
+    - DB clean_status 更新为 1 或 2
+  实际：________________________________
+
+【测试14.3】POST /test/image-recognition/cleanup-all 仍可用
+  步骤：POST /test/image-recognition/cleanup-all
+  预期：
+    - 批量清洗所有 clean_status=0 的记录
+    - 返回 {"code":200, "data":N}
+  实际：________________________________
+
+
+================================================================================
+
+
+15. 异常场景测试
+================================================================================
+
+【测试15.1】MinIO 服务不可达
+  前置：minio.endpoint 改为一个不存在的地址（如 http://192.168.2.200:9999）
+  步骤：POST /api/minio/scan-now
+  预期：
+    - 日志 [MinIO轮询] 扫描 MinIO 失败 bucket=..., prefix=...
+    - 不崩溃，下一轮 30s 后自动重试
+  实际：________________________________
+
+【测试15.2】司空2 Token 过期
+  前置：dji.openapi.user-token 改为无效值
+  步骤：POST /api/minio/scan-now
+  预期：
+    - getFlightTaskInfo 返回 code=401 或其他错误码
+    - 日志 [MinIO轮询] taskUuid=... getFlightTaskInfo 非0 code=...
+    - 跳过本轮，不崩溃
+  实际：________________________________
+
+【测试15.3】知眸服务不可达
+  前置：192.168.2.202:10042 不可达
+  步骤：POST /api/minio/scan-now
+  预期：
+    - createImageTask 返回 null
+    - 日志 [知眸-图片批量上报] 创建任务失败, 无法继续
+    - 返回 taskId=null，但自有模型线程仍正常执行
+    - 批次 PROCESSING 锁保留，等下一轮重试
+  实际：________________________________
+
+【测试15.4】自有模型服务不可达
+  前置：192.168.2.200:5173 不可达
+  步骤：POST /api/minio/scan-now
+  预期：
+    - 每张图日志 [自有模型] 调用异常 fileName=...
+    - 仍入库 call_status=2, clean_status=0
+    - 知眸回调到达后不会自动清洗（self 侧写了 self=1 但 call_status=2
+      → cleanupSingleImage 内部判断"自有模型无有效结果"→ clean_status=1）
+    - 不崩溃
+  实际：________________________________
+
+【测试15.5】Redis 不可达
+  前置：Redis 连接断开
+  步骤：POST /api/minio/scan-now
+  预期：
+    - 抢锁失败（setIfAbsent 抛异常）
+    - 日志 [MinIO轮询] scanAndProcess 顶层异常
+    - 下一轮自动重试
+  实际：________________________________
+
+【测试15.6】磁盘空间不足（下载失败）
+  前置：temp-dir 所在磁盘空间不足
+  步骤：POST /api/minio/scan-now
+  预期：
+    - 下载失败日志
+    - 批次锁释放，下一轮重试
+  实际：________________________________
+
+
+================================================================================
+
+
+16. 端到端全流程测试
+================================================================================
+
+  这是最终验收测试：从飞机落地到前端展示的完整链路。
+
+【测试16.1】完整自动化流程（无需任何人工介入）
+  前置：
+    - 飞机已执行航线任务，图片已同步到 MinIO
+    - image_task=1
+    - 所有服务可达
+    - 清空 Redis 中 minio:flight:* 相关 key
+    - 清空 DB 中该批次的旧记录（如重跑）
+
+  步骤：
+    1. 等待 30s（自动轮询触发）或 POST /api/minio/scan-now
+    2. 观察日志依次出现：
+       a. [MinIO轮询] 扫描到 1 个候选飞行任务批次
+       b. [MinIO轮询] ✅ 拿到处理锁 taskUuid=..., 图片数=15, TTL=1800s
+       c. [MinIO轮询] taskUuid=... 飞行任务名=..., SN=1581F8HHX25CL00A06BL
+       d. [MinIO轮询] 下载 taskUuid=... 成功=15/失败=0
+       e. [知眸-图片批量上报] 创建任务成功 taskId=..., 待上报图片数=15, prefix=dbc84414...
+       f. [自有模型] 调用完成 fileName=..., 耗时=...ms
+       g. [MinIO轮询] ✅ 分派完成 taskUuid=..., 图片数=15, zhimouTaskId=tsk_..., self(成功/失败)=15/0
+       h. [知眸-图片回调] 入库成功 ... localImageName=dbc84414.../DJI_..._0001_V
+       i. [自动清洗] ⭐ 知眸与自有模型结果均到齐 → 启动 cleanup localImageName=dbc84414.../DJI_..._0001_V
+       j. [清洗] 完成 localImageName=..., 结果=..., cleanStatus=1或2
+       k. [MinIO批次] ✅ 标记 COMPLETED taskUuid=dbc84414...
+       l. [MinIO批次] 删除临时下载目录 ... result=true
+    3. 检查 Redis:
+       - GET minio:flight:dbc84414... → "COMPLETED"
+       - KEYS minio:flight:img:dbc84414...* → (empty)
+    4. 检查 MySQL:
+       - SELECT COUNT(*) FROM zhimou_image_detection
+         WHERE local_image_name LIKE 'dbc84414%' AND clean_status != 0;
+         期望 15
+       - SELECT COUNT(*) FROM self_model_image_detection
+         WHERE local_image_name LIKE 'dbc84414%' AND clean_status != 0;
+         期望 15
+    5. 前端切换 alert_data_source=image
+    6. 查看 screen-v3 /alerts 页面
+
+  预期：
+    - 所有 15 张图 clean_status=1 或 2（无一为 0）
+    - 前端正常展示 clean_status=1 的告警
+    - tempDir 已清理
+    - Redis 批次 COMPLETED
+    - 下一轮轮询自动跳过该批次
+
+  实际（逐条打勾）：
+    □ a. 扫描到批次
+    □ b. 拿到锁
+    □ c. 获取 SN
+    □ d. 下载完成
+    □ e. 知眸任务创建
+    □ f. 自有模型调用
+    □ g. 分派完成
+    □ h. 知眸回调入库
+    □ i. 自动清洗触发
+    □ j. 清洗完成
+    □ k. 批次 COMPLETED
+    □ l. tempDir 清理
+    □ Redis 状态正确
+    □ MySQL 数据正确
+    □ 前端展示正确
+
+
+================================================================================
+
+
+17. 测试结果汇总表
+================================================================================
+
+| 编号  | 测试名称                           | 结果 | 备注 |
+|-------|-----------------------------------|------|------|
+| 1.1   | MinIO 连接成功                     |      |      |
+| 1.2   | MinIO 配置为空时降级               |      |      |
+| 1.3   | MinIO bucket 不存在                |      |      |
+| 2.1   | image_task=0 时轮询跳过            |      |      |
+| 2.2   | image_task=1 时轮询执行            |      |      |
+| 3.1   | 路径正则匹配                       |      |      |
+| 3.2   | 多组织/多项目隔离                  |      |      |
+| 3.3   | 空目录扫描                         |      |      |
+| 4.1   | 上传完整时正常处理                 |      |      |
+| 4.2   | 上传未完成时跳过                   |      |      |
+| 4.3   | media 数量不一致时跳过             |      |      |
+| 4.4   | 关闭完整性校验                     |      |      |
+| 5.1   | 从 detail API 获取真实 SN          |      |      |
+| 5.2   | SN 为空时跳过批次                  |      |      |
+| 6.1   | SETNX 抢锁成功                     |      |      |
+| 6.2   | 已有 PROCESSING 时跳过             |      |      |
+| 6.3   | COMPLETED 时永久跳过              |      |      |
+| 6.4   | PROCESSING TTL 过期后自动重试     |      |      |
+| 7.1   | 批量下载到 tempDir                 |      |      |
+| 7.2   | 残留旧文件清理                     |      |      |
+| 7.3   | 下载失败单张容错                   |      |      |
+| 8.1   | createAndReportImageBatch 带 prefix|      |      |
+| 8.2   | 上报间隔 1 秒                      |      |      |
+| 8.3   | 图片落盘到长期目录                 |      |      |
+| 9.1   | detectAndSave 4参数重载            |      |      |
+| 9.2   | 每张间隔 500ms                     |      |      |
+| 9.3   | 模型调用失败容错                   |      |      |
+| 10.1  | 自有先入库，知眸后到 → 自动清洗    |      |      |
+| 10.2  | 知眸先到，自有后入库 → 自动清洗    |      |      |
+| 10.3  | 全部 15 张图都自动清洗完成         |      |      |
+| 10.4  | 误识别判定 clean_status=2          |      |      |
+| 10.5  | 正常识别判定 clean_status=1       |      |      |
+| 11.1  | 批次标记 COMPLETED                 |      |      |
+| 11.2  | tempDir 清理                       |      |      |
+| 11.3  | 关闭 tempDir 清理                  |      |      |
+| 11.4  | COMPLETED 后不再重复处理           |      |      |
+| 12.1  | GET /api/minio/batches             |      |      |
+| 12.2  | POST /api/minio/retry/{taskUuid}   |      |      |
+| 12.3  | POST /api/minio/scan-now           |      |      |
+| 12.4  | retry 空 taskUuid                  |      |      |
+| 13.1  | alert_data_source=image 展示       |      |      |
+| 13.2  | alert_data_source=video 不受影响   |      |      |
+| 13.3  | 阶段3与阶段2记录共存               |      |      |
+| 14.1  | /test/image-recognition/run 仍可用 |      |      |
+| 14.2  | /test/image-recognition/cleanup    |      |      |
+| 14.3  | /test/image-recognition/cleanup-all|      |      |
+| 15.1  | MinIO 服务不可达                   |      |      |
+| 15.2  | 司空2 Token 过期                   |      |      |
+| 15.3  | 知眸服务不可达                     |      |      |
+| 15.4  | 自有模型服务不可达                 |      |      |
+| 15.5  | Redis 不可达                       |      |      |
+| 15.6  | 磁盘空间不足                       |      |      |
+| 16.1  | 端到端全流程                       |      |      |
+
+================================================================================
+ 测试完成签字：
+ 测试人：_______________  日期：_______________
+ 开发人：_______________  日期：_______________
+================================================================================

@@ -1,0 +1,10 @@
+fix: 201部署修复+识别流内网探测+视频画面自适应
+
+- 修复同步项目/航线500错误(DuplicateKeyException): Mapper添加物理删除方法,INSERT前先清旧记录
+- 修复识别流不显示: 探测始终用内网URL(probeUrl),外网请求时url为空则用probeUrl返回
+- STABLE_PROBE_THRESHOLD从3改为1,一次探测成功即标记available
+- 配置spring.redis前缀(Boot2.7非spring.data.redis)
+- 添加pull-url-template-ai识别流外网拉流模板
+- 前端object-fit:fill去黑边+@resize事件响应镜头切换
+- 前端build脚本移除vue-tsc类型检查
+- 数据库迁移到201+Redis远程访问+缺少表补齐

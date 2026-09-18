@@ -64,7 +64,7 @@ const store = useAppStore()
 
 const loginFormRef = ref<FormInstance>()
 const loading = ref(false)
-const screenTitle = ref(`${import.meta.env.VITE_COMPANY_NAME || '乐金'}无人机监控大屏`)
+const screenTitle = ref('无人机预警系统')
 
 const loginForm = reactive({
   username: '',

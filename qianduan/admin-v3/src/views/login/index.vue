@@ -63,7 +63,7 @@ const router = useRouter()
 const userStore = useUserStore()
 const loginFormRef = ref<FormInstance>()
 const loading = ref(false)
-const screenTitle = ref(`${import.meta.env.VITE_COMPANY_NAME || '乐金'}无人机管理系统`)
+const screenTitle = ref('无人机预警系统')
 
 const loginForm = reactive({
   username: '',

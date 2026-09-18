@@ -131,7 +131,8 @@ const handleLogout = async () => {
       type: 'warning'
     })
     userStore.logout()
-    window.location.href = '/login'
+    window.location.hash = '#/login'
+    window.location.reload()
   } catch {}
 }
 </script>
