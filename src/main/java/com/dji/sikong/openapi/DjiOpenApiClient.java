@@ -111,14 +111,13 @@ public class DjiOpenApiClient {
         return get("/openapi/v2.0/project", null, query);
     }
 
-    /** 获取项目设备列表 */
+    /** 获取项目设备列表（含机场+飞机拓扑，按 X-Project-Uuid header 过滤） */
     public JsonNode listProjectDevices(String projectUuid) {
         String actual = StrUtil.isNotBlank(projectUuid) ? projectUuid : properties.getDefaultProjectUuid();
         Map<String, Object> query = new HashMap<>();
-        if (StrUtil.isNotBlank(actual)) query.put("workspace_id", actual);
         query.put("pageSize", properties.getDefaultPageSize());
         query.put("pageNum", 1);
-        return get("/openapi/v2.0/devices", actual, query);
+        return get("/openapi/v2.0/project/device", actual, query);
     }
 
     /** 获取航线列表 */

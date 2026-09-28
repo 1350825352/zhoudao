@@ -652,8 +652,13 @@ public class ApiController {
 
     @PostMapping("/devices/sync-names")
     public R<?> syncDeviceNames() {
-        deviceSyncService.syncDeviceNamesFromOpenApi();
-        return R.ok("设备名称同步完成");
+        try {
+            deviceSyncService.fullRefreshDevicesFromOpenApi();
+            return R.ok("设备同步完成（已清空并重新拉取）");
+        } catch (Exception e) {
+            log.error("设备同步失败", e);
+            return R.fail("设备同步失败: " + e.getMessage());
+        }
     }
 
     @PostMapping("/alerts/fix-wayline-uuid")
