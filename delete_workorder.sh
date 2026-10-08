@@ -1,1 +1,0 @@
-mysql -u root -p123456 sikong_cloud_api -e "DELETE FROM work_order;"
