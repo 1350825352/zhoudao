@@ -341,7 +341,8 @@ public class ApiController {
 
         LiveStream live = getActiveLiveStream(sn);
         if (live != null) {
-            String playableUrl = streamProbeService.probePlayableHttpFlvUrl(live, internal);
+            // 按飞机SN枚举所有码流通道(与视频码流编号无关): 记录里是99-0-0但实际可能推99-0-91,哪路有流返回哪路
+            String playableUrl = streamProbeService.probePlayableUrlByDeviceSn(sn, null, internal);
             if (StrUtil.isNotBlank(playableUrl)) {
                 int count = STREAM_STABLE_COUNT.getOrDefault(sn, 0) + 1;
                 STREAM_STABLE_COUNT.put(sn, count);

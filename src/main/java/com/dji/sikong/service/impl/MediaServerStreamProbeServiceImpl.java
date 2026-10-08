@@ -26,8 +26,8 @@ public class MediaServerStreamProbeServiceImpl implements MediaServerStreamProbe
     @Resource
     private LiveStreamMapper liveStreamMapper;
 
-    private static final int CONNECT_TIMEOUT = 10000;
-    private static final int READ_TIMEOUT = 10000;
+    private static final int CONNECT_TIMEOUT = 3000;
+    private static final int READ_TIMEOUT = 3000;
 
     @Override
     public boolean isAircraftStreaming(String aircraftSn) {
@@ -179,6 +179,86 @@ public class MediaServerStreamProbeServiceImpl implements MediaServerStreamProbe
         }
     }
 
+    @Override
+    public String probePlayableUrlByDeviceSn(String deviceSn, java.util.Collection<String> extraCameras) {
+        // 自动模式: 先内网后外网
+        return probeBySn(deviceSn, extraCameras, true, true);
+    }
+
+    @Override
+    public String probePlayableUrlByDeviceSn(String deviceSn, java.util.Collection<String> extraCameras, boolean internal) {
+        return probeBySn(deviceSn, extraCameras, internal, !internal);
+    }
+
+    private String probeBySn(String deviceSn, java.util.Collection<String> extraCameras,
+                             boolean tryInternal, boolean tryPublic) {
+        if (StrUtil.isBlank(deviceSn)) return null;
+        DjiMediaProperties.StreamServer ss = mediaProperties.getStreamServer();
+        if (ss == null) return null;
+        String secret = extractSecret(ss.getRtmpUrl());
+
+        List<String> streamKeys = buildSnCandidateStreamKeys(deviceSn, extraCameras);
+        String netTag = tryInternal ? "内网" : "外网";
+
+        for (String sk : streamKeys) {
+            if (tryInternal) {
+                String internalTpl = ss.getPullUrlTemplateInternal();
+                if (StrUtil.isNotBlank(internalTpl)) {
+                    String url = buildPullUrl(internalTpl, sk, secret);
+                    if (probeHasFlv(url)) {
+                        System.out.println("[按SN流探测-内网命中✅] sn=" + deviceSn + " streamKey=" + sk + " url=" + url);
+                        return url;
+                    }
+                }
+            }
+            if (tryPublic) {
+                String publicTpl = ss.getPullUrlTemplate();
+                if (StrUtil.isNotBlank(publicTpl)) {
+                    String url = buildPullUrl(publicTpl, sk, secret);
+                    if (probeHasFlv(url)) {
+                        System.out.println("[按SN流探测-外网命中✅] sn=" + deviceSn + " streamKey=" + sk + " url=" + url);
+                        return url;
+                    }
+                }
+            }
+        }
+        System.out.println("[按SN流探测-无流❌] sn=" + deviceSn + " 网络=" + netTag
+                + " 已试候选=" + streamKeys + " 均不可播放");
+        return null;
+    }
+
+    /** 按SN构造候选streamKey(有序去重): 外部真实码流编号 → DB最新记录 → 常见编号兜底 → 裸SN */
+    private List<String> buildSnCandidateStreamKeys(String deviceSn, java.util.Collection<String> extraCameras) {
+        // 有序去重的候选视频码流编号: 外部真实配置(码流转发器)优先 → DB最新记录 → 常见编号兜底
+        java.util.LinkedHashSet<String> cameras = new java.util.LinkedHashSet<>();
+        if (extraCameras != null) {
+            for (String c : extraCameras) {
+                if (StrUtil.isNotBlank(c)) cameras.add(c.trim());
+            }
+        }
+        try {
+            LiveStream latest = liveStreamMapper.selectOne(new LambdaQueryWrapper<LiveStream>()
+                    .eq(LiveStream::getAircraftSn, deviceSn)
+                    .eq(LiveStream::getDeleted, 0)
+                    .orderByDesc(LiveStream::getId)
+                    .last(" LIMIT 1"));
+            if (latest != null && StrUtil.isNotBlank(latest.getCameraIndex())) {
+                cameras.add(latest.getCameraIndex());
+            }
+        } catch (Exception ignore) {}
+        // 常见视频码流编号兜底(99-0-91: M4TD变焦码流, 99-0-0: 广角码流, 0: 通用)
+        cameras.add("99-0-91");
+        cameras.add("99-0-0");
+        cameras.add("0");
+
+        List<String> streamKeys = new ArrayList<>(cameras.size());
+        for (String cam : cameras) {
+            streamKeys.add(deviceSn + "/" + cam);
+        }
+        // 注: 不再尝试裸SN(无camera路径段), SRS对裸SN路径不返回404而是挂起8秒超时, 会严重拖慢调度
+        return streamKeys;
+    }
+
     private List<String> buildCandidateStreamKeys(String aircraftSn) {
         List<String> result = new ArrayList<>(4);
         try {
@@ -191,6 +271,7 @@ public class MediaServerStreamProbeServiceImpl implements MediaServerStreamProbe
                 result.add(aircraftSn + "/" + latest.getCameraIndex());
             }
         } catch (Exception ignore) {}
+        result.add(aircraftSn + "/99-0-91");
         result.add(aircraftSn + "/99-0-0");
         result.add(aircraftSn + "/0");
         result.add(aircraftSn);

@@ -137,6 +137,47 @@ public class ZhimouTaskServiceImpl extends ServiceImpl<ZhimouTaskMapper, ZhimouT
     private static final String ZHIMOU_ALERT_TOPIC_PREFIX = "zhimou/alert/";
 
     // ================================================================
+    // 司空码流转发器"设备SN→真实视频码流编号集合"缓存
+    // 用途: 视频码流编号可能变化(如99-0-0被占用改为99-0-91),识别探测只按SN枚举,与具体码流编号无关
+    // 每60秒从openapi刷新一次; 查询失败时保留旧缓存
+    // ================================================================
+    private static final long CONVERTER_CAMERA_CACHE_TTL_MS = 60000L;
+    private volatile long converterCameraCacheTs = 0L;
+    private volatile Map<String, Set<String>> converterCameraCache = Collections.emptyMap();
+
+    /**
+     * 获取司空码流转发器的 SN→视频码流编号集合 映射(60秒缓存)
+     * 返回样例: {1581F8HGX252F00A018X=[99-0-91], 8UUXN2A00A00M9=[165-0-7]}
+     */
+    private Map<String, Set<String>> getConverterCameraMap() {
+        long now = System.currentTimeMillis();
+        if (now - converterCameraCacheTs < CONVERTER_CAMERA_CACHE_TTL_MS) {
+            return converterCameraCache;
+        }
+        Map<String, Set<String>> map = new HashMap<>();
+        try {
+            JsonNode resp = djiOpenApiClient.listStreamConverters(null);
+            if (resp != null && resp.has("data") && resp.get("data").has("list")) {
+                for (JsonNode c : resp.get("data").get("list")) {
+                    String sn = c.has("sn") ? c.get("sn").asText("") : "";
+                    String cam = c.has("camera") ? c.get("camera").asText("") : "";
+                    if (StrUtil.isNotBlank(sn) && StrUtil.isNotBlank(cam)) {
+                        map.computeIfAbsent(sn, k -> new HashSet<>()).add(cam);
+                    }
+                }
+            }
+            converterCameraCache = map;
+            System.out.println("[知眸-转换器镜头缓存🔄] 刷新成功 设备数=" + map.size() + " 映射=" + map);
+        } catch (Exception e) {
+            // 失败不覆盖旧缓存(可能是空或旧数据),仅打印,60秒后再试
+            System.out.println("[知眸-转换器镜头缓存⚠️] 刷新失败,保留旧缓存 err=" + e.getMessage());
+        } finally {
+            converterCameraCacheTs = now;
+        }
+        return converterCameraCache;
+    }
+
+    // ================================================================
     // 基于HTTP-FLV流检测的1秒调度器
     // 核心逻辑:
     //   1. 只看SRS上有没有HTTP-FLV流（不检查数据库status）
@@ -211,16 +252,18 @@ public class ZhimouTaskServiceImpl extends ServiceImpl<ZhimouTaskMapper, ZhimouT
                 return;
             }
 
-            // ====== 关键优化: 同一飞机+摄像头只保留最新(id最大)的1条记录, 避免历史旧记录重复创建知眸任务浪费并发 ======
+            // ====== 关键优化: 同一设备SN只保留最新(id最大)的1条记录, 避免历史旧记录重复创建知眸任务浪费并发 ======
+            //      去重key只用设备SN(不再拼视频码流编号): 识别只跟飞机SN绑定,与码流编号无关,同一设备码流编号可能从99-0-0变为99-0-91,
+            //      一个SN只允许一个识别任务,流探测时按SN枚举所有码流通道找可播放的那路
             //      例如: 同一飞机SN有13条历史记录, 但只会创建1个知眸任务, 不会触发50008并发不足
             java.util.Map<String, LiveStream> latestLiveByKey = new java.util.LinkedHashMap<>();
             for (LiveStream l : activeLives) {
-                String key = StrUtil.blankToDefault(l.getAircraftSn(), "") + "|" + StrUtil.blankToDefault(l.getCameraIndex(), "");
+                String key = StrUtil.blankToDefault(l.getAircraftSn(), "");
                 // 已按id倒序, 第一个遇到的就是最新的
                 latestLiveByKey.computeIfAbsent(key, k -> l);
             }
             if (latestLiveByKey.size() < activeLives.size()) {
-                System.out.println("[知眸-调度器-去重🗑️] 同一飞机+摄像头去重: 原始记录=" + activeLives.size() + " 条 → 去重后=" + latestLiveByKey.size() + " 条 (节省知眸并发)");
+                System.out.println("[知眸-调度器-去重🗑️] 同一设备SN去重: 原始记录=" + activeLives.size() + " 条 → 去重后=" + latestLiveByKey.size() + " 条 (节省知眸并发)");
             }
             List<LiveStream> dedupedLives = new java.util.ArrayList<>(latestLiveByKey.values());
 
@@ -236,16 +279,22 @@ public class ZhimouTaskServiceImpl extends ServiceImpl<ZhimouTaskMapper, ZhimouT
             String ymlApp = (properties.getOpenapi() == null) ? null : properties.getOpenapi().getDefaultAppId();
             String ymlPkg = (properties.getOpenapi() == null) ? null : properties.getOpenapi().getDefaultPkgId();
 
+            // 司空码流转发器真实视频码流编号映射(60秒缓存): 让探测优先枚举设备当前实际使用的码流通道(如99-0-91)
+            Map<String, Set<String>> converterCameraMap = getConverterCameraMap();
+
             // 2. 逐个检测流状态
             for (LiveStream live : activeLives) {
                 Long liveId = live.getId();
                 detectCnt++;
 
-                // 探测可播放的HTTP-FLV地址(先内网后外网),返回第一个可播放的地址
+                // 探测可播放的HTTP-FLV地址: 只按设备SN判断"该设备有没有流",与视频码流编号无关
+                // (码流编号可能从99-0-0变为99-0-91) → 枚举码流转发器真实码流编号+DB记录+兜底编号,返回第一个可播放的
                 String httpFlvUrl = null;
                 boolean playable = false;
                 try {
-                    httpFlvUrl = streamProbeService.probePlayableHttpFlvUrl(live);
+                    String probeSn = StrUtil.isNotBlank(live.getAircraftSn()) ? live.getAircraftSn() : live.getGatewaySn();
+                    Set<String> candidateCameras = converterCameraMap.getOrDefault(probeSn, Collections.emptySet());
+                    httpFlvUrl = streamProbeService.probePlayableUrlByDeviceSn(probeSn, candidateCameras);
                     playable = StrUtil.isNotBlank(httpFlvUrl);
                     System.out.println("[知眸-流检测-结果🔍] liveId=" + liveId
                             + " 飞机=" + live.getAircraftSn()

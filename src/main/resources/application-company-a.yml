@@ -12,7 +12,7 @@ spring:
 
   data:
     redis:
-      host: 223.113.158.186
+      host: 192.168.2.201
       port: 6379
       password: ""
       database: 0
